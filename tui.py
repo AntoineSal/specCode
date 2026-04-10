@@ -90,49 +90,84 @@ _SORRY_WORDS = ("sorry", "declaration uses", "uses 'sorry'")
 
 def validate_lean_spec(spec_content: str) -> tuple[bool, list[str]]:
     """
-    Validate spec_content via lake build in lean_project/ (15s timeout).
-    Returns (True, []) if valid, lake not found, timeout, or only sorry-related messages.
-    Returns (False, errors) if there are real errors.
+    Validate spec_content using pure Python — no lake, no subprocess.
+    Returns (True, []) if valid, (False, errors) otherwise.
     """
-    lean_project = Path(__file__).parent.resolve() / "lean_project"
-    main_lean = lean_project / "Main.lean"
-
-    if not lean_project.exists():
-        return (True, [])
-
-    original = main_lean.read_text(encoding="utf-8") if main_lean.exists() else ""
-    main_lean.write_text(spec_content, encoding="utf-8")
-
-    try:
-        result = subprocess.run(
-            ["lake", "build"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            cwd=str(lean_project),
-        )
-    except subprocess.TimeoutExpired:
-        return (True, [])
-    except FileNotFoundError:
-        return (True, [])
-    finally:
-        main_lean.write_text(original, encoding="utf-8")
-
-    if result.returncode == 0:
-        return (True, [])
-
-    output = (result.stdout + result.stderr).strip()
-    errors = clean_lean_error(output)
-
-    real_errors = [
-        msg for msg in errors
-        if not any(w in msg.lower() for w in _SORRY_WORDS)
+    _LEAN_RESERVED = [
+        "insert", "map", "length", "reverse", "append",
+        "head", "tail", "init", "last", "get",
     ]
 
-    if not real_errors:
-        return (True, [])
+    # Strip single-line comments for syntactic checks
+    stripped_lines = []
+    for line in spec_content.splitlines():
+        stripped_lines.append(re.sub(r"--.*$", "", line))
+    stripped = "\n".join(stripped_lines)
 
-    return (False, real_errors)
+    # ÉTAPE 1a — contenu non vide
+    if not stripped.strip():
+        return (False, ["spec is empty — add at least one `def`"])
+
+    # ÉTAPE 1b — au moins un `def`
+    if not re.search(r"^def\s+\w+", stripped, re.MULTILINE):
+        return (False, ["no `def` found — spec must define at least one function"])
+
+    # ÉTAPE 1d — pas de `def` sans nom
+    for i, line in enumerate(stripped.splitlines(), start=1):
+        if re.match(r"^\s*def\s*:=", line):
+            return (False, [f"unnamed `def` on line {i} — every def must have a name"])
+
+    # ÉTAPE 1c — chaque def/theorem/lemma doit contenir sorry
+    block_pattern = re.compile(r"^(def|theorem|lemma)\s+\w+", re.MULTILINE)
+    for m in block_pattern.finditer(stripped):
+        line_no = stripped[: m.start()].count("\n") + 1
+        keyword = m.group(1)
+        name = m.group(0).split()[1]
+        # Extraire le corps du bloc jusqu'au prochain bloc ou fin de fichier
+        rest = stripped[m.start():]
+        next_block = re.search(r"\n(?:def|theorem|lemma|#|end)\s+", rest[1:])
+        body = rest[: next_block.start() + 1] if next_block else rest
+        if not re.search(r":=\s*by\s+sorry|:=\s*sorry|\bsorry\b", body):
+            return (False, [
+                f"`{keyword} {name}` on line {line_no} is missing `:= sorry` "
+                f"— stubs must not be fully implemented"
+            ])
+
+    # ÉTAPE 1e — parenthèses et crochets équilibrés
+    depth_paren = 0
+    depth_bracket = 0
+    for i, line in enumerate(stripped.splitlines(), start=1):
+        for ch in line:
+            if ch == "(":
+                depth_paren += 1
+            elif ch == ")":
+                depth_paren -= 1
+                if depth_paren < 0:
+                    return (False, [f"unbalanced parentheses on line {i}"])
+            elif ch == "[":
+                depth_bracket += 1
+            elif ch == "]":
+                depth_bracket -= 1
+                if depth_bracket < 0:
+                    return (False, [f"unbalanced brackets on line {i}"])
+    if depth_paren != 0:
+        return (False, ["unbalanced parentheses — check for missing `)`"])
+    if depth_bracket != 0:
+        return (False, ["unbalanced brackets — check for missing `]`"])
+
+    # ÉTAPE 2a — les imports doivent être avant tout def/theorem
+    first_def = re.search(r"^(?:def|theorem|lemma)\s+", spec_content, re.MULTILINE)
+    if first_def:
+        late_import = re.search(r"^import\s+", spec_content[first_def.start():], re.MULTILINE)
+        if late_import:
+            abs_pos = first_def.start() + late_import.start()
+            line_no = spec_content[:abs_pos].count("\n") + 1
+            return (False, [f"`import` on line {line_no} must appear before any `def` or `theorem`"])
+
+    # ÉTAPE 2b — noms réservés (warning non bloquant, ignoré ici)
+    # (pas d'erreur retournée)
+
+    return (True, [])
 
 
 def _strip_error_header(content: str) -> str:

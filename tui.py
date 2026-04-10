@@ -25,6 +25,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 from orchestrator import (
+    clean_lean_error,
     count_blocks,
     load_api_key,
     parse_spec,
@@ -88,54 +89,65 @@ _ERROR_HEADER_MARKER = "-- ✗ speccode validation errors"
 _ERROR_SEPARATOR = "-- " + "─" * 49
 
 
+_REAL_ERROR_PATTERNS = [
+    "unknown constant",
+    "unknown identifier",
+    "unexpected token",
+    "expected token",
+    "type mismatch",
+    "application type mismatch",
+]
+
+
 def validate_lean_spec(spec_content: str) -> tuple[bool, str]:
     """
-    Validate spec_content with Lean (10s timeout).
-    Returns (True, "") if valid or lean is not installed.
-    Returns (False, cleaned_errors) if there are real errors.
-    Only "declaration uses 'sorry'" warnings are treated as valid.
+    Validate spec_content via lake build in lean_project/ (60s timeout).
+    Returns (True, "") if valid, lake not found, or only sorry-related errors.
+    Returns (False, cleaned_errors) if there are real non-sorry errors.
     """
-    tmp = Path("/tmp/speccode_validate.lean")
-    tmp.write_text(spec_content, encoding="utf-8")
-
     lean_project = Path(__file__).parent.resolve() / "lean_project"
+    main_lean = lean_project / "Main.lean"
+
+    if not lean_project.exists():
+        return (True, "")
+
+    original = main_lean.read_text(encoding="utf-8") if main_lean.exists() else ""
+    main_lean.write_text(spec_content, encoding="utf-8")
 
     try:
         result = subprocess.run(
-            ["lean", str(tmp)],
+            ["lake", "build"],
             capture_output=True,
             text=True,
-            timeout=10,
-            cwd=str(lean_project) if lean_project.exists() else None,
+            timeout=15,
+            cwd=str(lean_project),
         )
     except subprocess.TimeoutExpired:
-        return (False, "Lean validation timed out (10s)")
-    except FileNotFoundError:
-        # lean not in PATH — skip validation
         return (True, "")
+    except FileNotFoundError:
+        return (True, "")
+    finally:
+        main_lean.write_text(original, encoding="utf-8")
 
     if result.returncode == 0:
         return (True, "")
 
     output = (result.stdout + result.stderr).strip()
+    errors = clean_lean_error(output)
 
-    # If only sorry warnings, no real errors
-    error_lines = [l for l in output.splitlines() if "error:" in l]
-    if not error_lines:
+    if not errors:
         return (True, "")
 
-    # Clean: extract "line X, col Y: message" from each error line
-    cleaned: list[str] = []
-    for line in output.splitlines():
-        if "error:" in line:
-            m = re.match(r".*?:(\d+):(\d+):\s*error:\s*(.*)", line)
-            if m:
-                cleaned.append(f"line {m.group(1)}, col {m.group(2)}: {m.group(3)}")
-            else:
-                # fallback: strip leading path-like prefix
-                cleaned.append(re.sub(r"^[^\s]*:\s*", "", line).strip())
+    real_errors = [
+        msg for msg in errors
+        if any(p in msg.lower() for p in _REAL_ERROR_PATTERNS)
+        and "sorry" not in msg.lower()
+    ]
 
-    return (False, "\n".join(cleaned))
+    if not real_errors:
+        return (True, "")
+
+    return (False, "\n".join(real_errors))
 
 
 def _strip_error_header(content: str) -> str:
@@ -197,6 +209,9 @@ class DisplayState:
         self.fn_name = ""
         # error phase
         self.error_msg = ""
+        # validation phase
+        self.validation_state: str | None = None  # None | "validating" | "valid" | "invalid"
+        self.validation_errors: str = ""
 
     def handle_event(self, name: str, data: dict) -> None:
         with self._lock:
@@ -240,17 +255,29 @@ class DisplayState:
     def render_input_panel(self) -> Panel:
         with self._lock:
             lines = list(self.spec_lines)
+            vstate = self.validation_state
 
-        content = Text()
         if lines:
-            visible = lines[-20:]
-            for line in visible:
-                content.append(f"  {line}\n", style="white")
+            spec_text = "\n".join(lines)
+            content = Syntax(spec_text, "text", theme="monokai",
+                             word_wrap=True, background_color="default")
         else:
-            content.append("  ", style="")
-            content.append("Loading spec…\n", style="dim")
+            content = Text("  Loading spec…\n", style="dim")
 
-        return Panel(content, title="[dim]SPEC[/dim]", border_style="dim")
+        if vstate == "validating":
+            border = "bright_cyan"
+            title = "[bright_cyan]spec — validating...[/bright_cyan]"
+        elif vstate == "valid":
+            border = "bright_green"
+            title = "[bright_green]spec[/bright_green]"
+        elif vstate == "invalid":
+            border = "bright_red"
+            title = "[bright_red]spec[/bright_red]"
+        else:
+            border = "dim"
+            title = "[dim]spec[/dim]"
+
+        return Panel(content, title=title, border_style=border)
 
     def render_output_panel(self) -> Panel:
         with self._lock:
@@ -265,6 +292,10 @@ class DisplayState:
             dur = self.duration
             fn_name = self.fn_name
             err = self.error_msg
+            vstate = self.validation_state
+
+        if vstate in (None, "validating", "invalid"):
+            return Panel("", title="[dim]output[/dim]", border_style="dim")
 
         if phase == "generating":
             header = Text()
@@ -345,8 +376,8 @@ def build_renderable(state: DisplayState, stacked: bool):
     else:
         layout = Layout()
         layout.split_row(
-            Layout(input_panel, name="input"),
-            Layout(output_panel, name="output"),
+            Layout(input_panel, name="input", ratio=45),
+            Layout(output_panel, name="output", ratio=55),
         )
         return layout
 
@@ -471,6 +502,65 @@ def generate(spec: str, state: DisplayState, stacked: bool, language: str = "c++
     t.join()
 
 
+def validate_and_generate(content: str, state: DisplayState, stacked: bool, language: str) -> str:
+    """
+    Validates the spec then, if valid, generates code — all within one Live layout.
+    Returns "invalid" | "done" | "error".
+    """
+    with state._lock:
+        state.spec_lines = content.splitlines()
+        state.lang_fence = LANG_FENCE.get(language, "cpp")
+        state.validation_state = "validating"
+
+    validation_done = threading.Event()
+    pipeline_done = threading.Event()
+    validation_result: dict = {"valid": False, "errors": ""}
+
+    def _validate():
+        v, e = validate_lean_spec(content)
+        validation_result["valid"] = v
+        validation_result["errors"] = e
+        validation_done.set()
+
+    def _pipeline():
+        run_pipeline(content, on_event=state.handle_event, target_language=language)
+        pipeline_done.set()
+
+    with Live(
+        _Renderable(state, stacked),
+        console=console,
+        refresh_per_second=15,
+        transient=False,
+    ) as live:
+        vt = threading.Thread(target=_validate, daemon=True)
+        vt.start()
+        validation_done.wait()
+        vt.join()
+
+        valid = validation_result["valid"]
+        errors = validation_result["errors"]
+
+        with state._lock:
+            state.validation_state = "valid" if valid else "invalid"
+            state.validation_errors = errors
+
+        live.update(build_renderable(state, stacked))
+
+        if not valid:
+            time.sleep(1.5)
+            return "invalid"
+
+        time.sleep(0.3)  # brief green flash before generation
+
+        pt = threading.Thread(target=_pipeline, daemon=True)
+        pt.start()
+        pipeline_done.wait()
+        live.update(build_renderable(state, stacked))
+        pt.join()
+
+    return state.phase  # "done" or "error"
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -492,9 +582,14 @@ def main():
     _, rows = shutil.get_terminal_size()
     stacked = rows > 40
 
+    next_action: str | None = None
+
     try:
         while True:
-            action = _prompt_action(CURRENT_LANGUAGE)
+            if next_action is None:
+                action = _prompt_action(CURRENT_LANGUAGE)
+            else:
+                action, next_action = next_action, None
 
             if action == "quit":
                 break
@@ -506,50 +601,55 @@ def main():
             # action == "edit"
             tmp_spec = Path("/tmp/speccode_input.lean")
             spec = None
+            state = None
+
             while True:
                 raw = run_once()
                 if not raw:
                     break  # back to menu
 
-                # Strip any previously injected error header
                 content = _strip_error_header(raw)
                 if not content.strip():
                     console.print("[yellow]No input — file is empty.[/yellow]")
                     break
 
-                # Show discrete validation status
-                console.print()
-                console.print(f"[bright_cyan]◆ speccode  —  lean specs → {CURRENT_LANGUAGE} code[/bright_cyan]")
-                console.print()
-                console.print("[dim]  validating spec...[/dim]")
+                state = DisplayState()
+                result = validate_and_generate(content, state, stacked, CURRENT_LANGUAGE)
 
-                valid, errors = validate_lean_spec(content)
-
-                if valid:
-                    console.print("[bright_cyan]  ✓ spec valid — generating...[/bright_cyan]")
-                    console.print()
-                    spec = content
-                    break
-                else:
+                if result == "invalid":
+                    with state._lock:
+                        errors = state.validation_errors
                     _inject_errors_into_file(tmp_spec, content, errors)
-                    # loop: re-open editor with error comments injected
+                    continue  # re-open editor with errors injected
+
+                spec = content
+                break
 
             if spec is None:
                 continue  # back to main menu
 
-            # Generation
-            state = DisplayState()
-            generate(spec, state, stacked, CURRENT_LANGUAGE)
-
-            with state._lock:
-                phase = state.phase
-
-            if phase == "error":
-                time.sleep(3)
-
+            # Inline menu after generation
             console.print()
-            console.print(Rule("[dim]New run[/dim]"))
+            console.print("  [dim][e] new spec    [l] language    [q] quit[/dim]")
             console.print()
+
+            while True:
+                try:
+                    key = _read_key()
+                except (EOFError, KeyboardInterrupt):
+                    console.print()
+                    next_action = "quit"
+                    break
+                if key in ("e", "E", "\r", "\n"):
+                    next_action = "edit"
+                    break
+                if key in ("l", "L"):
+                    CURRENT_LANGUAGE = _prompt_language()
+                    next_action = "edit"
+                    break
+                if key in ("q", "Q", "\x03", "\x04"):
+                    next_action = "quit"
+                    break
 
     except KeyboardInterrupt:
         pass

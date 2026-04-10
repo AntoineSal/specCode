@@ -391,9 +391,14 @@ def _print_intro() -> None:
         "░╚════╝░░╚════╝░╚═════╝░╚══════╝",
     ]
     deco = "color(69)"
+    art_width = 66  # 32 (SPEC) + 2 (gap) + 32 (CODE)
+    subtitle = "formally verified code from lean specifications"
+    term_width, _ = shutil.get_terminal_size()
+    pad = " " * max(0, (term_width - art_width) // 2)
+    sub_pad = " " * max(0, (term_width - len(subtitle)) // 2)
     console.print()
     for s, c in zip(_SPEC_HALVES, _CODE_HALVES):
-        line = Text()
+        line = Text(pad)
         for ch in s:
             line.append(ch, style="bold bright_white" if ch == "█" else deco)
         line.append("  ")
@@ -401,7 +406,7 @@ def _print_intro() -> None:
             line.append(ch, style="bold bright_cyan" if ch == "█" else deco)
         console.print(line)
     console.print()
-    console.print("         [dim italic]formally verified code from lean specifications[/dim italic]")
+    console.print(f"{sub_pad}[dim italic]{subtitle}[/dim italic]")
     console.print()
 
 

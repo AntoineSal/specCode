@@ -88,6 +88,8 @@ def check_prerequisites() -> str | None:
 _ERROR_HEADER_MARKER = "-- ✗ speccode validation errors"
 _ERROR_SEPARATOR = "-- " + "─" * 49
 
+_TEMPLATE_HEADER = "-- speccode  |  save and close to generate"
+_TEMPLATE_SEPARATOR = "-- " + "─" * 41
 
 _SORRY_WORDS = ("sorry", "declaration uses", "uses 'sorry'")
 
@@ -140,16 +142,26 @@ def validate_lean_spec(spec_content: str) -> tuple[bool, list[str]]:
 
 
 def _strip_error_header(content: str) -> str:
-    """Remove the injected error comment block from the top of the content."""
-    if not content.startswith(_ERROR_HEADER_MARKER):
+    """Remove injected error block or template header from the top of the content."""
+    if content.startswith(_ERROR_HEADER_MARKER):
+        lines = content.splitlines(keepends=True)
+        sep_seen = 0
+        for i, line in enumerate(lines):
+            if line.rstrip().startswith("-- ─"):
+                sep_seen += 1
+                if sep_seen >= 2:  # opening + closing separator
+                    return "".join(lines[i + 1:]).strip()
         return content
-    lines = content.splitlines(keepends=True)
-    sep_seen = 0
-    for i, line in enumerate(lines):
-        if line.rstrip().startswith("-- ─"):
-            sep_seen += 1
-            if sep_seen >= 2:  # opening + closing separator
-                return "".join(lines[i + 1:]).strip()
+    if content.startswith(_TEMPLATE_HEADER):
+        lines = content.splitlines(keepends=True)
+        i = 0
+        while i < len(lines):
+            s = lines[i].rstrip()
+            if s == _TEMPLATE_HEADER or s.startswith("-- ─") or s == "":
+                i += 1
+            else:
+                break
+        return "".join(lines[i:]).strip()
     return content
 
 
@@ -387,13 +399,29 @@ def build_renderable(state: DisplayState, stacked: bool):
 # Menu prompts
 # ---------------------------------------------------------------------------
 
+def _print_intro() -> None:
+    """One-time startup banner."""
+    console.print()
+    console.print("[bright_cyan]╭─────────────────────────────╮[/bright_cyan]")
+    console.print("[bright_cyan]│                             │[/bright_cyan]")
+    console.print(
+        "[bright_cyan]│[/bright_cyan]   "
+        "[yellow]✦[/yellow] "
+        "[bold bright_white]spec[/bold bright_white][bold bright_cyan]code[/bold bright_cyan]"
+        "                [bright_cyan]│[/bright_cyan]"
+    )
+    console.print("[bright_cyan]│                             │[/bright_cyan]")
+    console.print("[bright_cyan]╰─────────────────────────────╯[/bright_cyan]")
+    console.print()
+    console.print(" [dim]lean specs  ·  verified code[/dim]")
+    console.print()
+
+
 def _prompt_action(language: str) -> str:
     """
     Display the main menu and wait for a valid key.
     Returns 'edit', 'language', or 'quit'.
     """
-    console.print()
-    console.print(f"[bright_cyan]◆ speccode  —  lean specs → {language} code[/bright_cyan]")
     console.print()
     console.print("  [e] new spec    [l] language    [q] quit")
     console.print()
@@ -580,7 +608,10 @@ def main():
     _, rows = shutil.get_terminal_size()
     stacked = rows > 40
 
+    _print_intro()
+
     next_action: str | None = None
+    has_validation_errors = False
 
     try:
         while True:
@@ -599,14 +630,24 @@ def main():
             # action == "edit"
             tmp_spec = Path("/tmp/speccode_input.lean")
 
-            # A. Open editor, read raw content (may include injected error comments)
+            # A. Prepare the temp file: clean template for new specs,
+            #    or keep as-is (errors already injected) for validation retries.
+            if not has_validation_errors:
+                tmp_spec.write_text(
+                    f"{_TEMPLATE_HEADER}\n{_TEMPLATE_SEPARATOR}\n\n",
+                    encoding="utf-8",
+                )
+
+            # Open editor, read raw content
             raw = run_once()
             if raw is None:
+                has_validation_errors = False
                 continue  # editor not found — back to menu
 
-            # B. Strip error comments; if nothing remains, back to menu
+            # B. Strip header comments; if nothing remains, back to menu
             content = _strip_error_header(raw)
             if not content.strip():
+                has_validation_errors = False
                 console.print("[yellow]No input.[/yellow]")
                 continue
 
@@ -616,6 +657,7 @@ def main():
 
             # E. Invalid — show menu; reopen with injected errors only if user presses [e]
             if result == "invalid":
+                has_validation_errors = True
                 with state._lock:
                     errors = list(state.validation_errors)
 
@@ -640,11 +682,13 @@ def main():
                         next_action = "edit"
                         break
                     if key in ("q", "Q", "\x03", "\x04"):
+                        has_validation_errors = False
                         next_action = "quit"
                         break
                 continue
 
             # F. Valid — pipeline ran (done or error); show inline menu
+            has_validation_errors = False
             console.print()
             console.print("  [dim][e] new spec    [l] language    [q] quit[/dim]")
             console.print()

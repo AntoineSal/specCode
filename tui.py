@@ -6,6 +6,7 @@ Terminal interface for the speccode pipeline.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -77,6 +78,92 @@ def check_prerequisites() -> str | None:
     except RuntimeError as e:
         return str(e)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Lean spec validation
+# ---------------------------------------------------------------------------
+
+_ERROR_HEADER_MARKER = "-- ✗ speccode validation errors"
+_ERROR_SEPARATOR = "-- " + "─" * 49
+
+
+def validate_lean_spec(spec_content: str) -> tuple[bool, str]:
+    """
+    Validate spec_content with Lean (10s timeout).
+    Returns (True, "") if valid or lean is not installed.
+    Returns (False, cleaned_errors) if there are real errors.
+    Only "declaration uses 'sorry'" warnings are treated as valid.
+    """
+    tmp = Path("/tmp/speccode_validate.lean")
+    tmp.write_text(spec_content, encoding="utf-8")
+
+    lean_project = Path(__file__).parent.resolve() / "lean_project"
+
+    try:
+        result = subprocess.run(
+            ["lean", str(tmp)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=str(lean_project) if lean_project.exists() else None,
+        )
+    except subprocess.TimeoutExpired:
+        return (False, "Lean validation timed out (10s)")
+    except FileNotFoundError:
+        # lean not in PATH — skip validation
+        return (True, "")
+
+    if result.returncode == 0:
+        return (True, "")
+
+    output = (result.stdout + result.stderr).strip()
+
+    # If only sorry warnings, no real errors
+    error_lines = [l for l in output.splitlines() if "error:" in l]
+    if not error_lines:
+        return (True, "")
+
+    # Clean: extract "line X, col Y: message" from each error line
+    cleaned: list[str] = []
+    for line in output.splitlines():
+        if "error:" in line:
+            m = re.match(r".*?:(\d+):(\d+):\s*error:\s*(.*)", line)
+            if m:
+                cleaned.append(f"line {m.group(1)}, col {m.group(2)}: {m.group(3)}")
+            else:
+                # fallback: strip leading path-like prefix
+                cleaned.append(re.sub(r"^[^\s]*:\s*", "", line).strip())
+
+    return (False, "\n".join(cleaned))
+
+
+def _strip_error_header(content: str) -> str:
+    """Remove the injected error comment block from the top of the content."""
+    if not content.startswith(_ERROR_HEADER_MARKER):
+        return content
+    lines = content.splitlines(keepends=True)
+    sep_seen = 0
+    for i, line in enumerate(lines):
+        if line.rstrip().startswith("-- ─"):
+            sep_seen += 1
+            if sep_seen >= 2:  # opening + closing separator
+                return "".join(lines[i + 1:]).strip()
+    return content
+
+
+def _inject_errors_into_file(path: Path, spec_content: str, errors: str) -> None:
+    """Prepend error comments to the spec file so the editor shows them."""
+    parts = [
+        f"{_ERROR_HEADER_MARKER} (fix before generating)\n",
+        f"{_ERROR_SEPARATOR}\n",
+    ]
+    for err_line in errors.splitlines():
+        parts.append(f"-- {err_line}\n")
+    parts.append(f"{_ERROR_SEPARATOR}\n")
+    parts.append("\n")
+    parts.append(spec_content)
+    path.write_text("".join(parts), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -417,9 +504,38 @@ def main():
                 continue
 
             # action == "edit"
-            spec = run_once()
-            if not spec:
-                continue  # back to menu
+            tmp_spec = Path("/tmp/speccode_input.lean")
+            spec = None
+            while True:
+                raw = run_once()
+                if not raw:
+                    break  # back to menu
+
+                # Strip any previously injected error header
+                content = _strip_error_header(raw)
+                if not content.strip():
+                    console.print("[yellow]No input — file is empty.[/yellow]")
+                    break
+
+                # Show discrete validation status
+                console.print()
+                console.print(f"[bright_cyan]◆ speccode  —  lean specs → {CURRENT_LANGUAGE} code[/bright_cyan]")
+                console.print()
+                console.print("[dim]  validating spec...[/dim]")
+
+                valid, errors = validate_lean_spec(content)
+
+                if valid:
+                    console.print("[bright_cyan]  ✓ spec valid — generating...[/bright_cyan]")
+                    console.print()
+                    spec = content
+                    break
+                else:
+                    _inject_errors_into_file(tmp_spec, content, errors)
+                    # loop: re-open editor with error comments injected
+
+            if spec is None:
+                continue  # back to main menu
 
             # Generation
             state = DisplayState()

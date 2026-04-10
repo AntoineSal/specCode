@@ -85,12 +85,6 @@ def check_prerequisites() -> str | None:
 # Lean spec validation
 # ---------------------------------------------------------------------------
 
-_ERROR_HEADER_MARKER = "-- ✗ speccode validation errors"
-_ERROR_SEPARATOR = "-- " + "─" * 49
-
-_TEMPLATE_HEADER = "-- speccode  |  save and close to generate"
-_TEMPLATE_SEPARATOR = "-- " + "─" * 41
-
 _SORRY_WORDS = ("sorry", "declaration uses", "uses 'sorry'")
 
 
@@ -142,38 +136,17 @@ def validate_lean_spec(spec_content: str) -> tuple[bool, list[str]]:
 
 
 def _strip_error_header(content: str) -> str:
-    """Remove injected error block or template header from the top of the content."""
-    if content.startswith(_ERROR_HEADER_MARKER):
-        lines = content.splitlines(keepends=True)
-        sep_seen = 0
-        for i, line in enumerate(lines):
-            if line.rstrip().startswith("-- ─"):
-                sep_seen += 1
-                if sep_seen >= 2:  # opening + closing separator
-                    return "".join(lines[i + 1:]).strip()
-        return content
-    if content.startswith(_TEMPLATE_HEADER):
-        lines = content.splitlines(keepends=True)
-        i = 0
-        while i < len(lines):
-            s = lines[i].rstrip()
-            if s == _TEMPLATE_HEADER or s.startswith("-- ─") or s == "":
-                i += 1
-            else:
-                break
-        return "".join(lines[i:]).strip()
-    return content
+    """Remove injected '-- ✗' error lines from the top of the content."""
+    lines = content.splitlines(keepends=True)
+    i = 0
+    while i < len(lines) and lines[i].startswith("-- ✗"):
+        i += 1
+    return "".join(lines[i:]).strip()
 
 
 def _inject_errors_into_file(path: Path, spec_content: str, errors: list[str]) -> None:
-    """Prepend error comments to the spec file so the editor shows them."""
-    parts = [
-        f"{_ERROR_HEADER_MARKER} (fix before generating)\n",
-        f"{_ERROR_SEPARATOR}\n",
-    ]
-    for err_line in errors:
-        parts.append(f"-- {err_line}\n")
-    parts.append(f"{_ERROR_SEPARATOR}\n")
+    """Prepend '-- ✗ ...' error lines to the spec file so the editor shows them."""
+    parts = [f"-- ✗ {err}\n" for err in errors]
     parts.append("\n")
     parts.append(spec_content)
     path.write_text("".join(parts), encoding="utf-8")
@@ -400,20 +373,35 @@ def build_renderable(state: DisplayState, stacked: bool):
 # ---------------------------------------------------------------------------
 
 def _print_intro() -> None:
-    """One-time startup banner."""
+    """One-time startup banner with figlet ASCII art identity."""
+    _SPEC_HALVES = [
+        "░██████╗██████╗░███████╗░█████╗░",
+        "██╔════╝██╔══██╗██╔════╝██╔══██╗",
+        "╚█████╗░██████╔╝█████╗░░██║░░╚═╝",
+        "░╚═══██╗██╔═══╝░██╔══╝░░██║░░██╗",
+        "██████╔╝██║░░░░░███████╗╚█████╔╝",
+        "╚═════╝░╚═╝░░░░░╚══════╝░╚════╝░",
+    ]
+    _CODE_HALVES = [
+        "░█████╗░░█████╗░██████╗░███████╗",
+        "██╔══██╗██╔══██╗██╔══██╗██╔════╝",
+        "██║░░╚═╝██║░░██║██║░░██║█████╗░░",
+        "██║░░██╗██║░░██║██║░░██║██╔══╝░░",
+        "╚█████╔╝╚█████╔╝██████╔╝███████╗",
+        "░╚════╝░░╚════╝░╚═════╝░╚══════╝",
+    ]
+    deco = "color(69)"
     console.print()
-    console.print("[bright_cyan]╭─────────────────────────────╮[/bright_cyan]")
-    console.print("[bright_cyan]│                             │[/bright_cyan]")
-    console.print(
-        "[bright_cyan]│[/bright_cyan]   "
-        "[yellow]✦[/yellow] "
-        "[bold bright_white]spec[/bold bright_white][bold bright_cyan]code[/bold bright_cyan]"
-        "                [bright_cyan]│[/bright_cyan]"
-    )
-    console.print("[bright_cyan]│                             │[/bright_cyan]")
-    console.print("[bright_cyan]╰─────────────────────────────╯[/bright_cyan]")
+    for s, c in zip(_SPEC_HALVES, _CODE_HALVES):
+        line = Text()
+        for ch in s:
+            line.append(ch, style="bold bright_white" if ch == "█" else deco)
+        line.append("  ")
+        for ch in c:
+            line.append(ch, style="bold bright_cyan" if ch == "█" else deco)
+        console.print(line)
     console.print()
-    console.print(" [dim]lean specs  ·  verified code[/dim]")
+    console.print("         [dim italic]formally verified code from lean specifications[/dim italic]")
     console.print()
 
 
@@ -630,13 +618,10 @@ def main():
             # action == "edit"
             tmp_spec = Path("/tmp/speccode_input.lean")
 
-            # A. Prepare the temp file: clean template for new specs,
+            # A. Prepare the temp file: empty for new specs,
             #    or keep as-is (errors already injected) for validation retries.
             if not has_validation_errors:
-                tmp_spec.write_text(
-                    f"{_TEMPLATE_HEADER}\n{_TEMPLATE_SEPARATOR}\n\n",
-                    encoding="utf-8",
-                )
+                tmp_spec.write_text("", encoding="utf-8")
 
             # Open editor, read raw content
             raw = run_once()

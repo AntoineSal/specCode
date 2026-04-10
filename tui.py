@@ -89,27 +89,20 @@ _ERROR_HEADER_MARKER = "-- ✗ speccode validation errors"
 _ERROR_SEPARATOR = "-- " + "─" * 49
 
 
-_REAL_ERROR_PATTERNS = [
-    "unknown constant",
-    "unknown identifier",
-    "unexpected token",
-    "expected token",
-    "type mismatch",
-    "application type mismatch",
-]
+_SORRY_WORDS = ("sorry", "declaration uses", "uses 'sorry'")
 
 
-def validate_lean_spec(spec_content: str) -> tuple[bool, str]:
+def validate_lean_spec(spec_content: str) -> tuple[bool, list[str]]:
     """
-    Validate spec_content via lake build in lean_project/ (60s timeout).
-    Returns (True, "") if valid, lake not found, or only sorry-related errors.
-    Returns (False, cleaned_errors) if there are real non-sorry errors.
+    Validate spec_content via lake build in lean_project/ (15s timeout).
+    Returns (True, []) if valid, lake not found, timeout, or only sorry-related messages.
+    Returns (False, errors) if there are real errors.
     """
     lean_project = Path(__file__).parent.resolve() / "lean_project"
     main_lean = lean_project / "Main.lean"
 
     if not lean_project.exists():
-        return (True, "")
+        return (True, [])
 
     original = main_lean.read_text(encoding="utf-8") if main_lean.exists() else ""
     main_lean.write_text(spec_content, encoding="utf-8")
@@ -123,31 +116,27 @@ def validate_lean_spec(spec_content: str) -> tuple[bool, str]:
             cwd=str(lean_project),
         )
     except subprocess.TimeoutExpired:
-        return (True, "")
+        return (True, [])
     except FileNotFoundError:
-        return (True, "")
+        return (True, [])
     finally:
         main_lean.write_text(original, encoding="utf-8")
 
     if result.returncode == 0:
-        return (True, "")
+        return (True, [])
 
     output = (result.stdout + result.stderr).strip()
     errors = clean_lean_error(output)
 
-    if not errors:
-        return (True, "")
-
     real_errors = [
         msg for msg in errors
-        if any(p in msg.lower() for p in _REAL_ERROR_PATTERNS)
-        and "sorry" not in msg.lower()
+        if not any(w in msg.lower() for w in _SORRY_WORDS)
     ]
 
     if not real_errors:
-        return (True, "")
+        return (True, [])
 
-    return (False, "\n".join(real_errors))
+    return (False, real_errors)
 
 
 def _strip_error_header(content: str) -> str:
@@ -164,13 +153,13 @@ def _strip_error_header(content: str) -> str:
     return content
 
 
-def _inject_errors_into_file(path: Path, spec_content: str, errors: str) -> None:
+def _inject_errors_into_file(path: Path, spec_content: str, errors: list[str]) -> None:
     """Prepend error comments to the spec file so the editor shows them."""
     parts = [
         f"{_ERROR_HEADER_MARKER} (fix before generating)\n",
         f"{_ERROR_SEPARATOR}\n",
     ]
-    for err_line in errors.splitlines():
+    for err_line in errors:
         parts.append(f"-- {err_line}\n")
     parts.append(f"{_ERROR_SEPARATOR}\n")
     parts.append("\n")
@@ -211,7 +200,7 @@ class DisplayState:
         self.error_msg = ""
         # validation phase
         self.validation_state: str | None = None  # None | "validating" | "valid" | "invalid"
-        self.validation_errors: str = ""
+        self.validation_errors: list[str] = []
 
     def handle_event(self, name: str, data: dict) -> None:
         with self._lock:
@@ -256,6 +245,7 @@ class DisplayState:
         with self._lock:
             lines = list(self.spec_lines)
             vstate = self.validation_state
+            validation_errors = list(self.validation_errors)
 
         if lines:
             spec_text = "\n".join(lines)
@@ -273,6 +263,12 @@ class DisplayState:
         elif vstate == "invalid":
             border = "bright_red"
             title = "[bright_red]spec[/bright_red]"
+            if validation_errors:
+                err_text = Text("\n")
+                for e in validation_errors:
+                    err_text.append(f"  ✗ {e}\n", style="bright_red")
+                from rich.console import Group
+                content = Group(content, err_text)
         else:
             border = "dim"
             title = "[dim]spec[/dim]"
@@ -294,8 +290,13 @@ class DisplayState:
             err = self.error_msg
             vstate = self.validation_state
 
-        if vstate in (None, "validating", "invalid"):
+        if vstate in (None, "validating"):
             return Panel("", title="[dim]output[/dim]", border_style="dim")
+
+        if vstate == "invalid":
+            msg = Text()
+            msg.append("✗ invalid spec — fix errors and try again", style="bright_red bold")
+            return Panel(msg, title="[bright_red]output[/bright_red]", border_style="bright_red")
 
         if phase == "generating":
             header = Text()
@@ -455,7 +456,7 @@ def _prompt_language() -> str:
 def run_once() -> str | None:
     """
     Open $EDITOR (or nano) on /tmp/speccode_input.lean.
-    Returns the spec content, or None if the file is empty or editor not found.
+    Returns raw file content (may include injected error comments), or None if editor not found.
     """
     tmp = Path("/tmp/speccode_input.lean")
     if not tmp.exists():
@@ -469,10 +470,7 @@ def run_once() -> str | None:
         console.print(f"[red]Editor not found: {editor}[/red]")
         return None
 
-    content = tmp.read_text(encoding="utf-8").strip() if tmp.exists() else ""
-    if not content:
-        console.print("[yellow]No input — file is empty.[/yellow]")
-    return content or None
+    return tmp.read_text(encoding="utf-8") if tmp.exists() else ""
 
 
 def generate(spec: str, state: DisplayState, stacked: bool, language: str = "c++") -> None:
@@ -514,7 +512,7 @@ def validate_and_generate(content: str, state: DisplayState, stacked: bool, lang
 
     validation_done = threading.Event()
     pipeline_done = threading.Event()
-    validation_result: dict = {"valid": False, "errors": ""}
+    validation_result: dict = {"valid": False, "errors": []}
 
     def _validate():
         v, e = validate_lean_spec(content)
@@ -600,35 +598,53 @@ def main():
 
             # action == "edit"
             tmp_spec = Path("/tmp/speccode_input.lean")
-            spec = None
-            state = None
 
-            while True:
-                raw = run_once()
-                if not raw:
-                    break  # back to menu
+            # A. Open editor, read raw content (may include injected error comments)
+            raw = run_once()
+            if raw is None:
+                continue  # editor not found — back to menu
 
-                content = _strip_error_header(raw)
-                if not content.strip():
-                    console.print("[yellow]No input — file is empty.[/yellow]")
-                    break
+            # B. Strip error comments; if nothing remains, back to menu
+            content = _strip_error_header(raw)
+            if not content.strip():
+                console.print("[yellow]No input.[/yellow]")
+                continue
 
-                state = DisplayState()
-                result = validate_and_generate(content, state, stacked, CURRENT_LANGUAGE)
+            # C/D. Show spec with "validating..." then validate and optionally generate
+            state = DisplayState()
+            result = validate_and_generate(content, state, stacked, CURRENT_LANGUAGE)
 
-                if result == "invalid":
-                    with state._lock:
-                        errors = state.validation_errors
-                    _inject_errors_into_file(tmp_spec, content, errors)
-                    continue  # re-open editor with errors injected
+            # E. Invalid — show menu; reopen with injected errors only if user presses [e]
+            if result == "invalid":
+                with state._lock:
+                    errors = list(state.validation_errors)
 
-                spec = content
-                break
+                console.print()
+                console.print("  [dim][e] edit spec    [l] language    [q] quit[/dim]")
+                console.print()
 
-            if spec is None:
-                continue  # back to main menu
+                while True:
+                    try:
+                        key = _read_key()
+                    except (EOFError, KeyboardInterrupt):
+                        console.print()
+                        next_action = "quit"
+                        break
+                    if key in ("e", "E", "\r", "\n"):
+                        _inject_errors_into_file(tmp_spec, content, errors)
+                        next_action = "edit"
+                        break
+                    if key in ("l", "L"):
+                        CURRENT_LANGUAGE = _prompt_language()
+                        _inject_errors_into_file(tmp_spec, content, errors)
+                        next_action = "edit"
+                        break
+                    if key in ("q", "Q", "\x03", "\x04"):
+                        next_action = "quit"
+                        break
+                continue
 
-            # Inline menu after generation
+            # F. Valid — pipeline ran (done or error); show inline menu
             console.print()
             console.print("  [dim][e] new spec    [l] language    [q] quit[/dim]")
             console.print()

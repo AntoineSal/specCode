@@ -61,17 +61,29 @@ Get a free key at [console.mistral.ai](https://console.mistral.ai).
 speccode
 ```
 
-The interactive TUI opens. From the main menu:
+The interactive TUI opens with an ASCII art banner, then the main menu:
 
 ```
-◆ speccode  —  lean specs → c++ code
-
   [e] new spec    [l] language    [q] quit
 ```
 
-- **[e]** — open your editor, write a Lean 4 spec, save and close → code is generated
+- **[e]** — open your editor, write a Lean 4 spec, save and close
 - **[l]** — choose the output language (C++, Python, Rust, OCaml, Go, TypeScript)
 - **[q]** — quit
+
+### Validation
+
+Before generating, speccode validates your spec against Lean 4 (if `lake` is available).
+If there are real errors (not `sorry` placeholders), they are shown inline and injected
+as comments at the top of the editor file when you press **[e]** to retry:
+
+```
+-- ✗ line 3, col 5: unknown identifier 'Lst'
+
+def myFunction ...
+```
+
+`sorry` entries are intentional — they mark unproven theorems and are not treated as errors.
 
 ### Output
 

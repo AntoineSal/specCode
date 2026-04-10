@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "speccode"
+version = "0.1.0"
+description = "Generate formally verified Lean 4 code from partial specifications"
+requires-python = ">=3.9"
+dependencies = [
+    "anthropic>=0.40.0",
+    "python-dotenv>=1.0.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+speccode = "tui:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["speccode*"]
+
+[tool.setuptools]
+py-modules = ["orchestrator", "tui"]

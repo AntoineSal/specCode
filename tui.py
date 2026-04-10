@@ -25,9 +25,13 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 from orchestrator import (
+    check_stale,
     clean_lean_error,
     count_blocks,
+    generate_specs_md,
+    init_context,
     load_api_key,
+    load_context,
     parse_spec,
     run_pipeline,
 )
@@ -247,8 +251,14 @@ class DisplayState:
                 out = data.get("output_dir", ".")
                 lang_ext = data.get("lang_ext", ".cpp")
                 self.lang_fence = data.get("lang_fence", "cpp")
-                self.code_path = str(Path(out) / f"{self.fn_name}{lang_ext}")
-                self.spec_path = str(Path(out) / f"{self.fn_name}_spec.lean")
+                self.code_path = data.get(
+                    "src_file",
+                    str(Path(out) / "src" / f"{self.fn_name}{lang_ext}"),
+                )
+                self.spec_path = data.get(
+                    "spec_file",
+                    str(Path(out) / "specs" / f"{self.fn_name}.lean"),
+                )
                 cost = data.get("cost", {})
                 self.cost_total = cost.get("cost_total", 0.0)
                 self.tokens = cost.get("codestral_tokens", 0)
@@ -355,7 +365,7 @@ class DisplayState:
             status.append("\n")
             status.append("✓ ", style="green bold")
             status.append(
-                f"saved to ./{fn_name}/  │  ${cost:.4f}  │  {dur:.1f}s",
+                f"saved to src/{fn_name}  │  ${cost:.4f}  │  {dur:.1f}s",
                 style="dim",
             )
 
@@ -445,13 +455,16 @@ def _print_intro() -> None:
     console.print()
 
 
-def _prompt_action(language: str) -> str:
+def _prompt_action(language: str, has_context: bool = False) -> str:
     """
     Display the main menu and wait for a valid key.
-    Returns 'edit', 'language', or 'quit'.
+    Returns 'edit', 'language', 'project', 'rebuild', or 'quit'.
     """
     console.print()
-    console.print("  [e] new spec    [l] language    [q] quit")
+    if has_context:
+        console.print("  [e] new spec    [r] rebuild    [p] project    [l] language    [q] quit")
+    else:
+        console.print("  [e] new spec    [l] language    [q] quit")
     console.print()
 
     while True:
@@ -466,6 +479,10 @@ def _prompt_action(language: str) -> str:
             return "edit"
         if key in ("l", "L"):
             return "language"
+        if key in ("p", "P") and has_context:
+            return "project"
+        if key in ("r", "R") and has_context:
+            return "rebuild"
         if key in ("q", "Q", "\x03", "\x04"):  # q, Ctrl+C, Ctrl+D
             return "quit"
         # unknown key: reshow prompt only
@@ -538,7 +555,12 @@ def generate(spec: str, state: DisplayState, stacked: bool, language: str = "c++
     pipeline_done = threading.Event()
 
     def pipeline_thread():
-        run_pipeline(spec, on_event=state.handle_event, target_language=language)
+        run_pipeline(
+            spec,
+            on_event=state.handle_event,
+            target_language=language,
+            project_dir=Path.cwd(),
+        )
         pipeline_done.set()
 
     t = threading.Thread(target=pipeline_thread, daemon=True)
@@ -577,7 +599,12 @@ def validate_and_generate(content: str, state: DisplayState, stacked: bool, lang
         validation_done.set()
 
     def _pipeline():
-        run_pipeline(content, on_event=state.handle_event, target_language=language)
+        run_pipeline(
+            content,
+            on_event=state.handle_event,
+            target_language=language,
+            project_dir=Path.cwd(),
+        )
         pipeline_done.set()
 
     with Live(
@@ -638,13 +665,31 @@ def main():
 
     _print_intro()
 
+    # Load project context
+    project_dir = Path.cwd()
+    context = load_context(project_dir)
+
+    if context is not None:
+        n_fns = len(context.get("functions", []))
+        lang_display = context.get("language", CURRENT_LANGUAGE)
+        CURRENT_LANGUAGE = context.get("language", CURRENT_LANGUAGE)
+        project_name = context.get("project", project_dir.name)
+        console.print(
+            f"  [cyan]◆ project: {project_name}  ·  {n_fns} functions  ·  {lang_display}[/cyan]"
+        )
+        stale = check_stale(context, project_dir)
+        if stale:
+            console.print(
+                f"  [yellow]⚠ {len(stale)} spec(s) have changed — run [r] to rebuild[/yellow]"
+            )
+
     next_action: str | None = None
     has_validation_errors = False
 
     try:
         while True:
             if next_action is None:
-                action = _prompt_action(CURRENT_LANGUAGE)
+                action = _prompt_action(CURRENT_LANGUAGE, has_context=(context is not None))
             else:
                 action, next_action = next_action, None
 
@@ -653,6 +698,55 @@ def main():
 
             if action == "language":
                 CURRENT_LANGUAGE = _prompt_language()
+                continue
+
+            if action == "project":
+                context = load_context(project_dir)
+                if context:
+                    lines = [f"  [bold]Project:[/bold] {context.get('project', project_dir.name)}"]
+                    lines.append(f"  Language: {context.get('language', '?')}")
+                    lines.append("")
+                    for fn in context.get("functions", []):
+                        thms = ", ".join(fn.get("theorems", [])) or "—"
+                        lines.append(f"  [cyan]{fn['name']}[/cyan]")
+                        lines.append(f"    spec: {fn.get('spec_file', '?')}")
+                        lines.append(f"    theorems: {thms}")
+                        lines.append(f"    generated: {fn.get('generated_at', '?')}")
+                    specs_md_path = project_dir / "SPECS.md"
+                    if specs_md_path.exists():
+                        lines.append("")
+                        lines.append("  [green]SPECS.md up to date[/green]")
+                    else:
+                        lines.append("")
+                        lines.append("  [yellow]SPECS.md missing — regenerate with [r][/yellow]")
+                    from rich.panel import Panel as _Panel
+                    console.print(_Panel(
+                        "\n".join(lines),
+                        title="[bold]Project Summary[/bold]",
+                        border_style="cyan",
+                    ))
+                continue
+
+            if action == "rebuild":
+                context = load_context(project_dir)
+                if not context:
+                    console.print("  [yellow]No context found.[/yellow]")
+                    continue
+                functions = context.get("functions", [])
+                console.print(f"  [cyan]Rebuilding {len(functions)} function(s)...[/cyan]")
+                for fn in functions:
+                    fn_name = fn["name"]
+                    spec_path = project_dir / fn.get("spec_file", f"specs/{fn_name}.lean")
+                    if not spec_path.exists():
+                        console.print(f"  [yellow]skip {fn_name}: spec not found[/yellow]")
+                        continue
+                    console.print(f"  [dim]→ {fn_name}[/dim]")
+                    spec_content = spec_path.read_text(encoding="utf-8")
+                    state = DisplayState()
+                    validate_and_generate(spec_content, state, stacked, CURRENT_LANGUAGE)
+                context = load_context(project_dir)
+                emit_ctx = {"fn_count": len(context.get("functions", [])) if context else 0}
+                console.print(f"  [green]✓ rebuild done — {emit_ctx['fn_count']} function(s)[/green]")
                 continue
 
             # action == "edit"
@@ -712,8 +806,9 @@ def main():
                         break
                 continue
 
-            # F. Valid — pipeline ran (done or error); show inline menu
+            # F. Valid — pipeline ran (done or error); reload context
             has_validation_errors = False
+            context = load_context(project_dir)
             console.print()
             console.print("  [dim][e] new spec    [l] language    [q] quit[/dim]")
             console.print()

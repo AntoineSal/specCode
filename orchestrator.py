@@ -5,6 +5,9 @@ Generates code from formal Lean 4 specifications.
 
 from __future__ import annotations
 
+import datetime
+import hashlib
+import json
 import os
 import re
 import time
@@ -227,6 +230,24 @@ def parse_theorem_stubs(thm_stubs: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Lean error parsing
+# ---------------------------------------------------------------------------
+
+def clean_lean_error(output: str) -> list[str]:
+    """Parse lake build output and return cleaned error messages (one per line)."""
+    cleaned: list[str] = []
+    for line in output.splitlines():
+        if "error:" not in line:
+            continue
+        m = re.match(r".*?:(\d+):(\d+):\s*error:\s*(.*)", line)
+        if m:
+            cleaned.append(f"line {m.group(1)}, col {m.group(2)}: {m.group(3)}")
+        else:
+            cleaned.append(re.sub(r"^[^\s]*:\s*", "", line).strip())
+    return cleaned
+
+
+# ---------------------------------------------------------------------------
 # Lean file assembly
 # ---------------------------------------------------------------------------
 
@@ -347,6 +368,7 @@ def call_codestral(
     target_language: str = "c++",
     on_chunk=None,
     on_retry=None,
+    context_block: str = "",
 ) -> str:
     """
     Call Codestral with streaming. Emits each text chunk via on_chunk(text).
@@ -355,9 +377,17 @@ def call_codestral(
     cfg = LANGUAGE_CONFIGS.get(target_language, LANGUAGE_CONFIGS["c++"])
     system_prompt = get_codestral_system(target_language)
 
+    if context_block:
+        user_content = (
+            f"Project context:\n{context_block}\n\n"
+            f"Spec:\n```lean\n{spec_content}\n```"
+        )
+    else:
+        user_content = f"Partial Lean 4 specification:\n\n```lean\n{spec_content}\n```"
+
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Partial Lean 4 specification:\n\n```lean\n{spec_content}\n```"},
+        {"role": "user", "content": user_content},
     ]
     accumulated: list[str] = []
 
@@ -412,14 +442,242 @@ def write_output_files(
     code: str,
     spec_content: str,
     target_language: str = "c++",
+    project_dir: Path | None = None,
 ) -> Path:
     cfg = LANGUAGE_CONFIGS.get(target_language, LANGUAGE_CONFIGS["c++"])
-    out_dir = Path.cwd() / fn_name
-    out_dir.mkdir(exist_ok=True)
+    if project_dir is None:
+        project_dir = Path.cwd()
+    specs_dir = project_dir / "specs"
+    src_dir = project_dir / "src"
+    specs_dir.mkdir(exist_ok=True)
+    src_dir.mkdir(exist_ok=True)
     if code:
-        (out_dir / f"{fn_name}{cfg['ext']}").write_text(code, encoding="utf-8")
-    (out_dir / f"{fn_name}_spec.lean").write_text(spec_content, encoding="utf-8")
-    return out_dir
+        (src_dir / f"{fn_name}{cfg['ext']}").write_text(code, encoding="utf-8")
+    (specs_dir / f"{fn_name}.lean").write_text(spec_content, encoding="utf-8")
+    return project_dir
+
+
+# ---------------------------------------------------------------------------
+# Project context
+# ---------------------------------------------------------------------------
+
+CONTEXT_FILE = "speccode.context"
+
+
+def load_context(project_dir: Path) -> dict | None:
+    """Read speccode.context if it exists, else return None."""
+    path = project_dir / CONTEXT_FILE
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def save_context(project_dir: Path, context: dict) -> None:
+    """Write speccode.context (indented JSON)."""
+    context["updated_at"] = datetime.date.today().isoformat()
+    path = project_dir / CONTEXT_FILE
+    path.write_text(json.dumps(context, indent=2), encoding="utf-8")
+
+
+def init_context(project_dir: Path, language: str) -> dict:
+    """Create a new empty context for this project."""
+    return {
+        "project": project_dir.name,
+        "language": language,
+        "created_at": datetime.date.today().isoformat(),
+        "updated_at": datetime.date.today().isoformat(),
+        "functions": [],
+    }
+
+
+def update_context_entry(
+    context: dict,
+    fn_name: str,
+    spec_file: str,
+    spec_content: str,
+    code_file: str,
+    signature: str,
+    language: str,
+    theorems: list[str],
+) -> dict:
+    """Add or update an entry in context['functions']."""
+    spec_hash = hashlib.sha256(spec_content.encode()).hexdigest()[:8]
+
+    # Parse "-- depends: funcA, funcB" comments
+    depends_on: list[str] = []
+    for m in re.finditer(r"--\s*depends:\s*(.+)", spec_content):
+        deps = [d.strip() for d in m.group(1).split(",") if d.strip()]
+        depends_on.extend(deps)
+
+    generated_at = datetime.datetime.now().isoformat(timespec="seconds")
+
+    entry = {
+        "name": fn_name,
+        "spec_file": spec_file,
+        "spec_hash": spec_hash,
+        "code_file": code_file,
+        "signature": signature,
+        "depends_on": depends_on,
+        "generated_at": generated_at,
+        "language": language,
+        "theorems": theorems,
+    }
+
+    # Replace existing entry with same name, or append
+    functions = context.get("functions", [])
+    for i, fn in enumerate(functions):
+        if fn.get("name") == fn_name:
+            functions[i] = entry
+            context["functions"] = functions
+            return context
+
+    functions.append(entry)
+    context["functions"] = functions
+    return context
+
+
+def extract_signature(code: str, language: str) -> str:
+    """Extract the first function signature from generated code."""
+    if language == "python":
+        m = re.search(
+            r"^(def\s+\w+\s*\([^)]*\)(?:\s*->\s*[\w\[\], |None]+)?)",
+            code, re.MULTILINE,
+        )
+        return m.group(1).strip() if m else ""
+    elif language == "rust":
+        m = re.search(
+            r"^((?:pub\s+)?fn\s+\w+[^{]+)",
+            code, re.MULTILINE,
+        )
+        return m.group(1).strip().rstrip() if m else ""
+    else:  # c++ and others
+        m = re.search(
+            r"^([\w:*&<>\[\]]+(?:\s+[\w:*&<>\[\]]+)*\s+\w+\s*\([^{;]*\))",
+            code, re.MULTILINE,
+        )
+        return m.group(1).strip() if m else ""
+
+
+def generate_specs_md(context: dict, project_dir: Path) -> str:
+    """Generate the content of SPECS.md from the current context."""
+    project_name = context.get("project", project_dir.name)
+    language = context.get("language", "c++")
+    cfg = LANGUAGE_CONFIGS.get(language, LANGUAGE_CONFIGS["c++"])
+    ext = cfg["ext"].lstrip(".")
+
+    lines = [
+        f"# {project_name}",
+        "",
+        "> This project is defined by its specifications.",
+        "> All code can be regenerated with `speccode --rebuild`.",
+        "",
+        "## Functions",
+        "",
+    ]
+
+    for fn in context.get("functions", []):
+        fn_name = fn["name"]
+        spec_path = project_dir / fn.get("spec_file", f"specs/{fn_name}.lean")
+        generated_at = fn.get("generated_at", "")
+
+        try:
+            spec_content = spec_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            spec_content = ""
+
+        lines += [
+            f"### {fn_name}",
+            f"**Spec:** `specs/{fn_name}.lean`  ",
+            f"**Output:** `src/{fn_name}.{ext}` ({language})  ",
+            f"**Generated:** {generated_at}",
+            "",
+            "```lean",
+            spec_content.strip(),
+            "```",
+            "",
+            "---",
+            "",
+        ]
+
+    return "\n".join(lines)
+
+
+def check_stale(context: dict, project_dir: Path) -> list[str]:
+    """Return names of functions whose spec has changed since last generation."""
+    stale: list[str] = []
+    for fn in context.get("functions", []):
+        fn_name = fn.get("name", "")
+        stored_hash = fn.get("spec_hash", "")
+        spec_file = project_dir / fn.get("spec_file", f"specs/{fn_name}.lean")
+        try:
+            current = spec_file.read_text(encoding="utf-8")
+            current_hash = hashlib.sha256(current.encode()).hexdigest()[:8]
+            if current_hash != stored_hash:
+                stale.append(fn_name)
+        except FileNotFoundError:
+            stale.append(fn_name)
+    return stale
+
+
+def get_context_for_prompt(
+    context: dict,
+    spec_content: str,
+    project_dir: Path,
+    max_functions: int = 5,
+) -> str:
+    """Build the context block to inject into the Codestral prompt."""
+    functions = context.get("functions", [])
+    if not functions:
+        return ""
+
+    # 1. Parse explicit dependencies
+    explicit_deps: list[str] = []
+    for m in re.finditer(r"--\s*depends:\s*(.+)", spec_content):
+        explicit_deps.extend(d.strip() for d in m.group(1).split(",") if d.strip())
+
+    # 2. Gather candidate functions
+    selected: list[dict] = []
+    seen: set[str] = set()
+
+    # Priority: explicit deps first
+    for fn in functions:
+        if fn["name"] in explicit_deps and fn["name"] not in seen:
+            selected.append(fn)
+            seen.add(fn["name"])
+            if len(selected) >= max_functions:
+                break
+
+    # Fill up to max_functions with functions whose name appears in spec_content
+    for fn in functions:
+        if len(selected) >= max_functions:
+            break
+        if fn["name"] not in seen and fn["name"] in spec_content:
+            selected.append(fn)
+            seen.add(fn["name"])
+
+    if not selected:
+        return ""
+
+    # 3. Build output string
+    lines = ["Available functions in this project:"]
+    for fn in selected:
+        sig = fn.get("signature", "")
+        theorems = fn.get("theorems", [])
+        code_file = fn.get("code_file", "")
+        thm_summary = ", ".join(theorems) if theorems else ""
+
+        lines.append(f"  — {sig or fn['name']}")
+        if thm_summary:
+            lines.append(f"    spec: {thm_summary}")
+        if code_file:
+            lines.append(f"    file: {code_file}")
+    lines.append("")
+    lines.append("You may call these functions directly.")
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -445,18 +703,28 @@ def run_pipeline(
     spec_content: str,
     on_event=None,
     target_language: str = "c++",
+    project_dir: Path | None = None,
 ) -> dict:
     """
     3-step pipeline: parse → generate → write.
-    Emits: spec_parsed, generating, streaming, api_retry, done, error.
+    Emits: spec_parsed, generating, streaming, api_retry, done, error, context_updated.
     """
     cfg = LANGUAGE_CONFIGS.get(target_language, LANGUAGE_CONFIGS["c++"])
+
+    if project_dir is None:
+        project_dir = Path.cwd()
 
     def emit(name: str, data: dict = {}):
         if on_event:
             on_event(name, data)
 
     token_usage = {"codestral_input": 0, "codestral_output": 0}
+
+    # Step 0: Load / init context
+    context = load_context(project_dir)
+    if context is None:
+        context = init_context(project_dir, target_language)
+    context_block = get_context_for_prompt(context, spec_content, project_dir)
 
     # Step 1: Parse
     imports, fn_stubs, thm_stubs = parse_spec(spec_content)
@@ -481,18 +749,41 @@ def run_pipeline(
             client, spec_content, token_usage,
             target_language=target_language,
             on_chunk=on_chunk, on_retry=on_retry,
+            context_block=context_block,
         )
     except Exception as e:
         emit("error", {"message": str(e)})
         return {"success": False, "error": str(e)}
 
-    # Step 3: Write files
-    out_dir = write_output_files(fn_name, code, spec_content, target_language)
+    # Step 3: Write files (specs/ and src/)
+    out_dir = write_output_files(fn_name, code, spec_content, target_language, project_dir)
     cost = compute_cost(token_usage)
+
+    # Step 4: Update context
+    spec_file = f"specs/{fn_name}.lean"
+    code_file = f"src/{fn_name}{cfg['ext']}"
+    signature = extract_signature(code, target_language)
+    theorems = re.findall(r"^(?:theorem|lemma)\s+(\w+)", spec_content, re.MULTILINE)
+    context = update_context_entry(
+        context,
+        fn_name=fn_name,
+        spec_file=spec_file,
+        spec_content=spec_content,
+        code_file=code_file,
+        signature=signature,
+        language=target_language,
+        theorems=theorems,
+    )
+    save_context(project_dir, context)
+    specs_md = generate_specs_md(context, project_dir)
+    (project_dir / "SPECS.md").write_text(specs_md, encoding="utf-8")
+    emit("context_updated", {"fn_count": len(context["functions"])})
 
     emit("done", {
         "code": code,
         "output_dir": str(out_dir),
+        "src_file": str(out_dir / code_file),
+        "spec_file": str(out_dir / spec_file),
         "cost": cost,
         "fn_name": fn_name,
         "lang": target_language,
@@ -518,7 +809,44 @@ if __name__ == "__main__":
 
     if len(sys.argv) < 2:
         print("Usage: python orchestrator.py <spec.lean> [language]")
+        print("       python orchestrator.py --rebuild [language]")
         sys.exit(1)
+
+    def print_event(name, data):
+        if name != "streaming":
+            print(f"[{name}] {data}")
+
+    if sys.argv[1] == "--rebuild":
+        lang = sys.argv[2] if len(sys.argv) > 2 else "c++"
+        project_dir = Path.cwd()
+        context = load_context(project_dir)
+        if context is None:
+            print("No speccode.context found in current directory.")
+            sys.exit(1)
+
+        functions = context.get("functions", [])
+        print(f"Rebuilding {len(functions)} function(s) in {project_dir.name}...")
+        for fn in functions:
+            fn_name = fn["name"]
+            spec_path = project_dir / fn.get("spec_file", f"specs/{fn_name}.lean")
+            if not spec_path.exists():
+                print(f"  [skip] {fn_name}: spec file not found ({spec_path})")
+                continue
+            print(f"  [{fn_name}] regenerating...")
+            spec_content = spec_path.read_text(encoding="utf-8")
+            result = run_pipeline(
+                spec_content,
+                on_event=print_event,
+                target_language=lang,
+                project_dir=project_dir,
+            )
+            if result["success"]:
+                cost = result["cost"]
+                print(f"  [{fn_name}] done — ${cost['cost_total']:.4f}")
+            else:
+                print(f"  [{fn_name}] error: {result.get('error', '')}")
+        print("Rebuild complete.")
+        sys.exit(0)
 
     spec_path = Path(sys.argv[1])
     if not spec_path.exists():
@@ -528,11 +856,12 @@ if __name__ == "__main__":
     lang = sys.argv[2] if len(sys.argv) > 2 else "c++"
     spec_content = spec_path.read_text(encoding="utf-8")
 
-    def print_event(name, data):
-        if name != "streaming":
-            print(f"[{name}] {data}")
-
-    result = run_pipeline(spec_content, on_event=print_event, target_language=lang)
+    result = run_pipeline(
+        spec_content,
+        on_event=print_event,
+        target_language=lang,
+        project_dir=Path.cwd(),
+    )
     if result["success"]:
         print(f"\nOutput: {result['output_dir']}")
         cost = result["cost"]

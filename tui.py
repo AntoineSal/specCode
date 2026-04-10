@@ -285,8 +285,8 @@ class DisplayState:
             content = Text("  Loading spec…\n", style="dim")
 
         if vstate == "validating":
-            border = "bright_cyan"
-            title = "[bright_cyan]spec — validating...[/bright_cyan]"
+            border = "rgb(100,140,180)"
+            title = "[rgb(100,140,180)]spec — validating...[/rgb(100,140,180)]"
         elif vstate == "valid":
             border = "bright_green"
             title = "[bright_green]spec[/bright_green]"
@@ -330,8 +330,8 @@ class DisplayState:
 
         if phase == "generating":
             header = Text()
-            header.append(f"{_sp()} ", style="bright_cyan")
-            header.append("Codestral is generating…", style="bright_cyan bold")
+            header.append(f"{_sp()} ", style="rgb(100,140,180)")
+            header.append("Codestral is generating…", style="rgb(100,140,180) bold")
             header.append(f"  [{elapsed:.1f}s]\n\n", style="dim")
             if retry:
                 header.append(f"  {retry}\n\n", style="yellow")
@@ -350,7 +350,7 @@ class DisplayState:
             else:
                 content = header
 
-            return Panel(content, title="[bright_cyan]OUTPUT[/bright_cyan]", border_style="bright_cyan")
+            return Panel(content, title="[rgb(100,140,180)]OUTPUT[/rgb(100,140,180)]", border_style="rgb(100,140,180)")
 
         if phase == "done":
             try:
@@ -448,7 +448,7 @@ def _print_intro() -> None:
             line.append(ch, style="bold bright_white" if ch == "█" else deco)
         line.append("  ")
         for ch in c:
-            line.append(ch, style="bold bright_cyan" if ch == "█" else deco)
+            line.append(ch, style="bold rgb(100,140,180)" if ch == "█" else deco)
         console.print(line)
     console.print()
     console.print(f"{sub_pad}[dim italic]{subtitle}[/dim italic]")
@@ -675,7 +675,7 @@ def main():
         CURRENT_LANGUAGE = context.get("language", CURRENT_LANGUAGE)
         project_name = context.get("project", project_dir.name)
         console.print(
-            f"  [cyan]◆ project: {project_name}  ·  {n_fns} functions  ·  {lang_display}[/cyan]"
+            f"  [rgb(100,140,180)]◆ project: {project_name}  ·  {n_fns} functions  ·  {lang_display}[/rgb(100,140,180)]"
         )
         stale = check_stale(context, project_dir)
         if stale:
@@ -708,7 +708,7 @@ def main():
                     lines.append("")
                     for fn in context.get("functions", []):
                         thms = ", ".join(fn.get("theorems", [])) or "—"
-                        lines.append(f"  [cyan]{fn['name']}[/cyan]")
+                        lines.append(f"  [rgb(100,140,180)]{fn['name']}[/rgb(100,140,180)]")
                         lines.append(f"    spec: {fn.get('spec_file', '?')}")
                         lines.append(f"    theorems: {thms}")
                         lines.append(f"    generated: {fn.get('generated_at', '?')}")
@@ -723,7 +723,7 @@ def main():
                     console.print(_Panel(
                         "\n".join(lines),
                         title="[bold]Project Summary[/bold]",
-                        border_style="cyan",
+                        border_style="rgb(100,140,180)",
                     ))
                 continue
 
@@ -733,7 +733,7 @@ def main():
                     console.print("  [yellow]No context found.[/yellow]")
                     continue
                 functions = context.get("functions", [])
-                console.print(f"  [cyan]Rebuilding {len(functions)} function(s)...[/cyan]")
+                console.print(f"  [rgb(100,140,180)]Rebuilding {len(functions)} function(s)...[/rgb(100,140,180)]")
                 for fn in functions:
                     fn_name = fn["name"]
                     spec_path = project_dir / fn.get("spec_file", f"specs/{fn_name}.lean")

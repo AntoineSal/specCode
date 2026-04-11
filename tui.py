@@ -485,9 +485,8 @@ def render_menu(project_dir: Path) -> str:
 
         console.print()
         header = Text("  ")
-        header.append("◆ speccode", style="bold rgb(100,140,180)")
-        header.append("  ·  ", style="dim")
-        header.append(project_name, style="bright_white")
+        header.append("◆ ", style="bold rgb(100,140,180)")
+        header.append(project_name, style="bold bright_white")
         console.print(header)
 
         stats = Text("    ")
@@ -498,7 +497,10 @@ def render_menu(project_dir: Path) -> str:
         console.print(stats)
     else:
         console.print()
-        console.print(Text("  ◆ speccode", style="bold rgb(100,140,180)"))
+        no_proj = Text("  ")
+        no_proj.append("◆ ", style="bold rgb(100,140,180)")
+        no_proj.append("new project", style="dim")
+        console.print(no_proj)
 
     # Build menu line
     items = [("e", "new spec")]

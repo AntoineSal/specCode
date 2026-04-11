@@ -706,7 +706,20 @@ def main():
                     lines = [f"  [bold]Project:[/bold] {context.get('project', project_dir.name)}"]
                     lines.append(f"  Language: {context.get('language', '?')}")
                     lines.append("")
-                    for fn in context.get("functions", []):
+                    all_entries = context.get("functions", [])
+                    type_entries = [e for e in all_entries if e.get("kind") == "type"]
+                    fn_entries = [e for e in all_entries if e.get("kind", "function") == "function"]
+                    if type_entries:
+                        lines.append(f"  [dim]Types ({len(type_entries)})[/dim]")
+                        for fn in type_entries:
+                            lines.append(
+                                f"  [rgb(100,140,180)]{fn['name']}[/rgb(100,140,180)]"
+                                f"         {fn.get('spec_file', '?')}"
+                            )
+                        lines.append("")
+                    if fn_entries:
+                        lines.append(f"  [dim]Functions ({len(fn_entries)})[/dim]")
+                    for fn in fn_entries:
                         thms = ", ".join(fn.get("theorems", [])) or "—"
                         lines.append(f"  [rgb(100,140,180)]{fn['name']}[/rgb(100,140,180)]")
                         lines.append(f"    spec: {fn.get('spec_file', '?')}")

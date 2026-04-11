@@ -106,6 +106,20 @@ LANGUAGE_CONFIGS = {
 }
 
 
+LEAN_TYPE_MAP: dict[str, dict[str, str]] = {
+    "c++":        {"Nat": "uint32_t", "Int": "int32_t", "Bool": "bool", "Float": "double", "String": "std::string"},
+    "python":     {"Nat": "int", "Int": "int", "Bool": "bool", "Float": "float", "String": "str"},
+    "rust":       {"Nat": "u32", "Int": "i32", "Bool": "bool", "Float": "f64", "String": "String"},
+    "ocaml":      {"Nat": "int", "Int": "int", "Bool": "bool", "Float": "float", "String": "string"},
+    "go":         {"Nat": "uint32", "Int": "int32", "Bool": "bool", "Float": "float64", "String": "string"},
+    "typescript": {"Nat": "number", "Int": "number", "Bool": "boolean", "Float": "number", "String": "string"},
+}
+
+
+def _map_lean_type(lean_type: str, language: str) -> str:
+    return LEAN_TYPE_MAP.get(language, LEAN_TYPE_MAP["c++"]).get(lean_type, lean_type)
+
+
 def get_codestral_system(target_language: str = "c++") -> str:
     cfg = LANGUAGE_CONFIGS.get(target_language, LANGUAGE_CONFIGS["c++"])
     return (
@@ -387,6 +401,7 @@ def call_codestral(
     on_chunk=None,
     on_retry=None,
     context_block: str = "",
+    kind: str = "function",
 ) -> str:
     """
     Call Codestral with streaming. Emits each text chunk via on_chunk(text).
@@ -395,7 +410,24 @@ def call_codestral(
     cfg = LANGUAGE_CONFIGS.get(target_language, LANGUAGE_CONFIGS["c++"])
     system_prompt = get_codestral_system(target_language)
 
-    if context_block:
+    if kind == "type":
+        type_preamble = (
+            "Generate ONLY a header file for this type. "
+            "No implementation file needed. "
+            "Include a proper struct/class definition with all fields from the Lean spec."
+        )
+        if context_block:
+            user_content = (
+                f"Project context:\n{context_block}\n\n"
+                f"{type_preamble}\n\n"
+                f"Spec:\n```lean\n{spec_content}\n```"
+            )
+        else:
+            user_content = (
+                f"{type_preamble}\n\n"
+                f"Lean 4 type specification:\n\n```lean\n{spec_content}\n```"
+            )
+    elif context_block:
         user_content = (
             f"Project context:\n{context_block}\n\n"
             f"Spec:\n```lean\n{spec_content}\n```"
@@ -447,9 +479,43 @@ def call_codestral(
 # Output files
 # ---------------------------------------------------------------------------
 
+def detect_spec_kind(spec_content: str) -> str:
+    """Return "type" if the spec defines a type with no functions, else "function"."""
+    has_type = bool(re.search(r"^(structure|inductive|abbrev|class)\s+", spec_content, re.MULTILINE))
+    has_def = bool(re.search(r"^def\s+", spec_content, re.MULTILINE))
+    if has_type and not has_def:
+        return "type"
+    return "function"
+
+
+def extract_type_fields(spec_content: str) -> list[str]:
+    """Parse field names and types from a Lean structure block."""
+    fields: list[str] = []
+    in_structure = False
+    for line in spec_content.splitlines():
+        if re.match(r"^structure\s+\w+.*\bwhere\b", line):
+            in_structure = True
+            continue
+        if in_structure:
+            m = re.match(r"^\s+(\w+)\s*:\s*(.+)", line)
+            if m:
+                fields.append(f"{m.group(1)}: {m.group(2).strip()}")
+            elif line.strip() == "" or re.match(r"^\S", line):
+                in_structure = False
+    return fields
+
+
 def detect_function_name(spec_content: str) -> str:
     """Extract first def name from spec for output directory naming."""
     m = re.search(r"^def\s+(\w+)", spec_content, re.MULTILINE)
+    if m:
+        return m.group(1)
+    return "output"
+
+
+def detect_type_name(spec_content: str) -> str:
+    """Extract the first structure/inductive/abbrev/class name from spec."""
+    m = re.search(r"^(?:structure|inductive|abbrev|class)\s+(\w+)", spec_content, re.MULTILINE)
     if m:
         return m.group(1)
     return "output"
@@ -461,6 +527,7 @@ def write_output_files(
     spec_content: str,
     target_language: str = "c++",
     project_dir: Path | None = None,
+    kind: str = "function",
 ) -> Path:
     cfg = LANGUAGE_CONFIGS.get(target_language, LANGUAGE_CONFIGS["c++"])
     if project_dir is None:
@@ -470,8 +537,12 @@ def write_output_files(
     specs_dir.mkdir(exist_ok=True)
     src_dir.mkdir(exist_ok=True)
     if code:
-        (src_dir / f"{fn_name}{cfg['ext']}").write_text(code, encoding="utf-8")
-        _write_header_file(src_dir, fn_name, code, target_language)
+        if kind == "type":
+            # Type specs generate only a header — no implementation file
+            (src_dir / f"{fn_name}.hpp").write_text(code, encoding="utf-8")
+        else:
+            (src_dir / f"{fn_name}{cfg['ext']}").write_text(code, encoding="utf-8")
+            _write_header_file(src_dir, fn_name, code, target_language)
     (specs_dir / f"{fn_name}.lean").write_text(spec_content, encoding="utf-8")
     return project_dir
 
@@ -547,6 +618,8 @@ def update_context_entry(
     signature: str,
     language: str,
     theorems: list[str],
+    kind: str = "function",
+    fields: list[str] | None = None,
 ) -> dict:
     """Add or update an entry in context['functions']."""
     spec_hash = hashlib.sha256(spec_content.encode()).hexdigest()[:8]
@@ -569,6 +642,8 @@ def update_context_entry(
         "generated_at": generated_at,
         "language": language,
         "theorems": theorems,
+        "kind": kind,
+        "fields": fields or [],
     }
 
     # Replace existing entry with same name, or append
@@ -707,28 +782,52 @@ def get_context_for_prompt(
     if not selected:
         return ""
 
-    # 3. Build signatures block
-    lines = ["Available functions in this project:"]
-    for fn in selected:
-        sig = fn.get("signature", "")
-        theorems = fn.get("theorems", [])
-        code_file = fn.get("code_file", "")
-        thm_summary = ", ".join(theorems) if theorems else ""
+    # 3. Separate types and functions
+    type_entries = [fn for fn in selected if fn.get("kind") == "type"]
+    fn_entries = [fn for fn in selected if fn.get("kind", "function") == "function"]
 
-        lines.append(f"  — {sig or fn['name']}")
-        if thm_summary:
-            lines.append(f"    spec: {thm_summary}")
-        if code_file:
-            lines.append(f"    file: {code_file}")
-    lines.append("")
-    lines.append("You may call these functions directly.")
+    lines: list[str] = []
 
-    # 4. Build include/import instructions
-    include_lines = _build_include_lines(selected, target_language)
-    if include_lines:
+    if type_entries:
+        lines.append("Available types in this project:")
+        for fn in type_entries:
+            name = fn["name"]
+            raw_fields = fn.get("fields", [])
+            mapped_fields: list[str] = []
+            for f in raw_fields:
+                if ":" in f:
+                    fname, ftype = f.split(":", 1)
+                    mapped_fields.append(f"{fname.strip()}: {_map_lean_type(ftype.strip(), target_language)}")
+                else:
+                    mapped_fields.append(f)
+            lines.append(f" — {name} (struct)")
+            if mapped_fields:
+                lines.append(f"   fields: {', '.join(mapped_fields)}")
+            lines.append(f'   include: #include "{name}.hpp"')
         lines.append("")
-        lines.append("Add these includes at the top of your file:")
-        lines.extend(f"  {inc}" for inc in include_lines)
+
+    if fn_entries:
+        lines.append("Available functions in this project:")
+        for fn in fn_entries:
+            sig = fn.get("signature", "")
+            theorems = fn.get("theorems", [])
+            code_file = fn.get("code_file", "")
+            thm_summary = ", ".join(theorems) if theorems else ""
+
+            lines.append(f"  — {sig or fn['name']}")
+            if thm_summary:
+                lines.append(f"    spec: {thm_summary}")
+            if code_file:
+                lines.append(f"    file: {code_file}")
+        lines.append("")
+        lines.append("You may call these functions directly.")
+
+        # 4. Build include/import instructions for functions
+        include_lines = _build_include_lines(fn_entries, target_language)
+        if include_lines:
+            lines.append("")
+            lines.append("Add these includes at the top of your file:")
+            lines.extend(f"  {inc}" for inc in include_lines)
 
     return "\n".join(lines)
 
@@ -803,11 +902,12 @@ def run_pipeline(
     )
 
     # Step 1: Parse
+    kind = detect_spec_kind(spec_content)
     imports, fn_stubs, thm_stubs = parse_spec(spec_content)
     fn_count = count_blocks(fn_stubs)
     thm_count = count_blocks(thm_stubs)
-    fn_name = detect_function_name(spec_content)
-    emit("spec_parsed", {"fn_count": fn_count, "thm_count": thm_count})
+    fn_name = detect_type_name(spec_content) if kind == "type" else detect_function_name(spec_content)
+    emit("spec_parsed", {"fn_count": fn_count, "thm_count": thm_count, "kind": kind})
 
     # Step 2: Generate
     emit("generating", {})
@@ -826,20 +926,22 @@ def run_pipeline(
             target_language=target_language,
             on_chunk=on_chunk, on_retry=on_retry,
             context_block=context_block,
+            kind=kind,
         )
     except Exception as e:
         emit("error", {"message": str(e)})
         return {"success": False, "error": str(e)}
 
     # Step 3: Write files (specs/ and src/)
-    out_dir = write_output_files(fn_name, code, spec_content, target_language, project_dir)
+    out_dir = write_output_files(fn_name, code, spec_content, target_language, project_dir, kind=kind)
     cost = compute_cost(token_usage)
 
     # Step 4: Update context
     spec_file = f"specs/{fn_name}.lean"
-    code_file = f"src/{fn_name}{cfg['ext']}"
-    signature = extract_signature(code, target_language)
+    code_file = f"src/{fn_name}.hpp" if kind == "type" else f"src/{fn_name}{cfg['ext']}"
+    signature = "" if kind == "type" else extract_signature(code, target_language)
     theorems = re.findall(r"^(?:theorem|lemma)\s+(\w+)", spec_content, re.MULTILINE)
+    fields = extract_type_fields(spec_content) if kind == "type" else []
     context = update_context_entry(
         context,
         fn_name=fn_name,
@@ -849,6 +951,8 @@ def run_pipeline(
         signature=signature,
         language=target_language,
         theorems=theorems,
+        kind=kind,
+        fields=fields,
     )
     save_context(project_dir, context)
     specs_md = generate_specs_md(context, project_dir)

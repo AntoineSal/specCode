@@ -112,9 +112,17 @@ def validate_lean_spec(spec_content: str) -> tuple[bool, list[str]]:
     if not stripped.strip():
         return (False, ["spec is empty — add at least one `def`"])
 
-    # ÉTAPE 1b — au moins un `def`
-    if not re.search(r"^def\s+\w+", stripped, re.MULTILINE):
-        return (False, ["no `def` found — spec must define at least one function"])
+    # ÉTAPE 1b — au moins un `def` OU un type (structure/inductive/abbrev/class)
+    has_def = bool(re.search(r"^def\s+\w+", stripped, re.MULTILINE))
+    has_type = bool(re.search(
+        r"^(structure|inductive|abbrev|class)\s+\w+",
+        stripped, re.MULTILINE
+    ))
+    if not has_def and not has_type:
+        return (False, [
+            "spec must define at least one function (`def`) "
+            "or one type (`structure`, `inductive`, `class`)"
+        ])
 
     # ÉTAPE 1d — pas de `def` sans nom
     for i, line in enumerate(stripped.splitlines(), start=1):

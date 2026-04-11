@@ -825,36 +825,25 @@ def main():
             state = DisplayState()
             result = validate_and_generate(content, state, stacked, CURRENT_LANGUAGE)
 
-            # E. Invalid — show menu; reopen with injected errors only if user presses [e]
+            # E. Invalid — show full menu; inject errors if user chooses to edit
             if result == "invalid":
                 has_validation_errors = True
                 with state._lock:
                     errors = list(state.validation_errors)
 
-                console.print()
-                console.print("  [dim][e] edit spec    [l] language    [q] quit[/dim]")
-                console.print()
-
-                while True:
-                    try:
-                        key = _read_key()
-                    except (EOFError, KeyboardInterrupt):
-                        console.print()
-                        next_action = "quit"
-                        break
-                    if key in ("e", "E", "\r", "\n"):
-                        _inject_errors_into_file(tmp_spec, content, errors)
-                        next_action = "edit"
-                        break
-                    if key in ("l", "L"):
-                        CURRENT_LANGUAGE = _prompt_language()
-                        _inject_errors_into_file(tmp_spec, content, errors)
-                        next_action = "edit"
-                        break
-                    if key in ("q", "Q", "\x03", "\x04"):
-                        has_validation_errors = False
-                        next_action = "quit"
-                        break
+                action = render_menu(project_dir)
+                if action == "edit":
+                    _inject_errors_into_file(tmp_spec, content, errors)
+                    next_action = "edit"
+                elif action == "language":
+                    CURRENT_LANGUAGE = _prompt_language()
+                    _inject_errors_into_file(tmp_spec, content, errors)
+                    next_action = "edit"
+                elif action == "quit":
+                    has_validation_errors = False
+                    next_action = "quit"
+                else:
+                    next_action = action  # project or rebuild — pass through
                 continue
 
             # F. Valid — pipeline ran (done or error); show full menu

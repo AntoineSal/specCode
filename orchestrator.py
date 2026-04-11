@@ -748,6 +748,7 @@ def get_context_for_prompt(
     project_dir: Path,
     max_functions: int = 5,
     target_language: str = "c++",
+    current_fn_name: str = "",
 ) -> str:
     """Build the context block to inject into the Codestral prompt."""
     functions = context.get("functions", [])
@@ -765,6 +766,8 @@ def get_context_for_prompt(
 
     # Priority: explicit deps first
     for fn in functions:
+        if fn["name"] == current_fn_name:
+            continue  # ne pas s'injecter soi-même
         if fn["name"] in explicit_deps and fn["name"] not in seen:
             selected.append(fn)
             seen.add(fn["name"])
@@ -775,6 +778,8 @@ def get_context_for_prompt(
     for fn in functions:
         if len(selected) >= max_functions:
             break
+        if fn["name"] == current_fn_name:
+            continue  # ne pas s'injecter soi-même
         if fn["name"] not in seen and fn["name"] in spec_content:
             selected.append(fn)
             seen.add(fn["name"])
@@ -897,16 +902,18 @@ def run_pipeline(
     context = load_context(project_dir)
     if context is None:
         context = init_context(project_dir, target_language)
-    context_block = get_context_for_prompt(
-        context, spec_content, project_dir, target_language=target_language
-    )
-
     # Step 1: Parse
     kind = detect_spec_kind(spec_content)
     imports, fn_stubs, thm_stubs = parse_spec(spec_content)
     fn_count = count_blocks(fn_stubs)
     thm_count = count_blocks(thm_stubs)
     fn_name = detect_type_name(spec_content) if kind == "type" else detect_function_name(spec_content)
+
+    context_block = get_context_for_prompt(
+        context, spec_content, project_dir,
+        target_language=target_language,
+        current_fn_name=fn_name,
+    )
     emit("spec_parsed", {"fn_count": fn_count, "thm_count": thm_count, "kind": kind})
 
     # Step 2: Generate

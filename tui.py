@@ -463,20 +463,62 @@ def _print_intro() -> None:
     console.print()
 
 
-def _prompt_action(language: str, has_context: bool = False) -> str:
+def render_menu(project_dir: Path) -> str:
     """
-    Display the main menu and wait for a valid key.
-    Returns 'edit', 'language', 'project', 'rebuild', or 'quit'.
+    Load context, display project header + menu, wait for a keypress.
+    Returns: 'edit', 'language', 'project', 'rebuild', or 'quit'.
+    Updates CURRENT_LANGUAGE from context if available.
     """
-    console.print()
+    global CURRENT_LANGUAGE
+
+    context = load_context(project_dir)
+    has_context = context is not None
+
     if has_context:
-        console.print("  [e] new spec    [r] rebuild    [p] project    [l] language    [q] quit")
+        CURRENT_LANGUAGE = context.get("language", CURRENT_LANGUAGE)
+        project_name = context.get("project", project_dir.name)
+        all_entries = context.get("functions", [])
+        n_total = len(all_entries)
+        n_types = sum(1 for e in all_entries if e.get("kind") == "type")
+        n_functions = n_total - n_types
+        language = context.get("language", CURRENT_LANGUAGE)
+
+        console.print()
+        header = Text("  ")
+        header.append("◆ speccode", style="bold rgb(100,140,180)")
+        header.append("  ·  ", style="dim")
+        header.append(project_name, style="bright_white")
+        console.print(header)
+
+        stats = Text("    ")
+        stats.append(
+            f"{n_total} specs  ·  {n_types} types  ·  {n_functions} functions  ·  {language}",
+            style="dim",
+        )
+        console.print(stats)
     else:
-        console.print("  [e] new spec    [l] language    [q] quit")
+        console.print()
+        console.print(Text("  ◆ speccode", style="bold rgb(100,140,180)"))
+
+    # Build menu line
+    items = [("e", "new spec")]
+    if has_context:
+        items += [("r", "rebuild"), ("p", "project")]
+    items += [("l", "language"), ("q", "quit")]
+
+    menu_text = Text("  ")
+    for i, (key, label) in enumerate(items):
+        if i > 0:
+            menu_text.append("   ", style="dim")
+        menu_text.append(f"[{key}]", style="rgb(100,140,180)")
+        menu_text.append(f" {label}", style="dim")
+
+    console.print()
+    console.print(menu_text)
     console.print()
 
     while True:
-        console.print("  > ", end="")
+        console.print("  [rgb(100,140,180)]>[/rgb(100,140,180)] ", end="")
         try:
             key = _read_key()
         except (EOFError, KeyboardInterrupt):
@@ -677,27 +719,13 @@ def main():
     project_dir = Path.cwd()
     context = load_context(project_dir)
 
-    if context is not None:
-        n_fns = len(context.get("functions", []))
-        lang_display = context.get("language", CURRENT_LANGUAGE)
-        CURRENT_LANGUAGE = context.get("language", CURRENT_LANGUAGE)
-        project_name = context.get("project", project_dir.name)
-        console.print(
-            f"  [rgb(100,140,180)]◆ project: {project_name}  ·  {n_fns} functions  ·  {lang_display}[/rgb(100,140,180)]"
-        )
-        stale = check_stale(context, project_dir)
-        if stale:
-            console.print(
-                f"  [yellow]⚠ {len(stale)} spec(s) have changed — run [r] to rebuild[/yellow]"
-            )
-
     next_action: str | None = None
     has_validation_errors = False
 
     try:
         while True:
             if next_action is None:
-                action = _prompt_action(CURRENT_LANGUAGE, has_context=(context is not None))
+                action = render_menu(project_dir)
             else:
                 action, next_action = next_action, None
 
@@ -827,30 +855,10 @@ def main():
                         break
                 continue
 
-            # F. Valid — pipeline ran (done or error); reload context
+            # F. Valid — pipeline ran (done or error); show full menu
             has_validation_errors = False
             context = load_context(project_dir)
-            console.print()
-            console.print("  [dim][e] new spec    [l] language    [q] quit[/dim]")
-            console.print()
-
-            while True:
-                try:
-                    key = _read_key()
-                except (EOFError, KeyboardInterrupt):
-                    console.print()
-                    next_action = "quit"
-                    break
-                if key in ("e", "E", "\r", "\n"):
-                    next_action = "edit"
-                    break
-                if key in ("l", "L"):
-                    CURRENT_LANGUAGE = _prompt_language()
-                    next_action = "edit"
-                    break
-                if key in ("q", "Q", "\x03", "\x04"):
-                    next_action = "quit"
-                    break
+            next_action = render_menu(project_dir)
 
     except KeyboardInterrupt:
         pass

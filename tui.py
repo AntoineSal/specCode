@@ -5,10 +5,8 @@ Terminal interface for the speccode pipeline.
 
 from __future__ import annotations
 
-import hashlib
 import os
 import re
-import select
 import shutil
 import subprocess
 import sys
@@ -22,6 +20,7 @@ from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.text import Text
 
@@ -29,15 +28,12 @@ from orchestrator import (
     check_stale,
     clean_lean_error,
     count_blocks,
-    generate_main,
     generate_specs_md,
     init_context,
-    LANGUAGE_CONFIGS,
     load_api_key,
     load_context,
     parse_spec,
     run_pipeline,
-    save_context,
 )
 
 console = Console()
@@ -467,444 +463,115 @@ def _print_intro() -> None:
     console.print()
 
 
-def _read_key_safe() -> str:
+def render_menu(project_dir: Path) -> str:
     """
-    Read one key from stdin using raw termios, with proper Esc detection on Mac.
-    - Bare Esc (no follow-up chars within 50ms) → returns 'ESC'
-    - Arrow sequences → returns '\x1b[A', '\x1b[B', '\x1b[C', '\x1b[D'
-    - Any other char → returns it as-is
+    Load context, display project header + menu, wait for a keypress.
+    Returns: 'edit', 'language', 'project', 'rebuild', or 'quit'.
+    Updates CURRENT_LANGUAGE from context if available.
     """
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        ch = sys.stdin.read(1)
-        if ch == "\x1b":
-            r, _, _ = select.select([sys.stdin], [], [], 0.05)
-            if r:
-                ch2 = sys.stdin.read(1)
-                if ch2 == "[":
-                    ch3 = sys.stdin.read(1)
-                    return "\x1b[" + ch3  # arrow key
-                return "\x1b" + ch2
-            return "ESC"  # bare Esc, no follow-up
-        return ch
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    global CURRENT_LANGUAGE
 
-
-# ---------------------------------------------------------------------------
-# Menu — ANSI-based rendering, exact line counting
-# ---------------------------------------------------------------------------
-
-_B = "\x1b[38;2;100;140;180m"   # blue
-_W = "\x1b[97;1m"                # bright white + bold
-_D = "\x1b[2m"                   # dim
-_R = "\x1b[0m"                   # reset
-
-
-def _kw(key: str, label: str) -> str:
-    return f"{_B}[{key}]{_R} {label}"
-
-
-def clear_lines(n: int) -> None:
-    """Move up n lines and erase everything below — single atomic operation."""
-    sys.stdout.write(f"\x1b[{n}A\x1b[0J")
-    sys.stdout.flush()
-
-
-def print_menu(state: dict) -> int:
-    """Build menu as a plain ANSI string, print it, return exact line count."""
-    menu = state["menu"]
-    context = state.get("context")
+    context = load_context(project_dir)
     has_context = context is not None
-    project_dir: Path = state["project_dir"]
 
     if has_context:
+        CURRENT_LANGUAGE = context.get("language", CURRENT_LANGUAGE)
         project_name = context.get("project", project_dir.name)
         all_entries = context.get("functions", [])
         n_total = len(all_entries)
         n_types = sum(1 for e in all_entries if e.get("kind") == "type")
-        n_fns = n_total - n_types
+        n_functions = n_total - n_types
         language = context.get("language", CURRENT_LANGUAGE)
-        stats = f"  {_D}{n_total} specs  ·  {n_types} types  ·  {n_fns} fns  ·  {language}{_R}"
-    else:
-        project_name = "new project"
-        stats = ""
 
-    crumb_map: dict[str, list[str]] = {
-        "specs":       ["specs"],
-        "code":        ["code"],
-        "project":     ["project"],
-        "language":    ["project", "language"],
-        "select_spec": ["specs", "modify"],
-    }
-    title = f"  {_B}◆{_R} {_W}{project_name}{_R}"
-    for crumb in crumb_map.get(menu, []):
-        title += f"  {_D}›  {crumb}{_R}"
+        console.print()
+        header = Text("  ")
+        header.append("◆ ", style="bold rgb(100,140,180)")
+        header.append(project_name, style="bold bright_white")
+        console.print(header)
 
-    if menu == "main":
-        items = [_kw("s", "specs")]
-        if has_context:
-            items += [_kw("c", "code"), _kw("p", "project")]
-        items.append(_kw("q", "quit"))
-        opts = "  " + "   ".join(items)
-        text = f"\n{title}\n{stats}\n\n{opts}\n\n  >"
-
-    elif menu == "specs":
-        items = [_kw("e", "new")]
-        if has_context:
-            items.append(_kw("m", "modify"))
-        opts = "  " + "   ".join(items)
-        text = f"\n{title}\n\n{opts}\n\n  {_D}Esc to go back{_R}\n\n  >"
-
-    elif menu == "code":
-        opts = "  " + "   ".join([
-            _kw("g", "generate main"), _kw("r", "rebuild"),
-            _kw("k", "compile"), _kw("x", "run"),
-        ])
-        text = f"\n{title}\n\n{opts}\n\n  {_D}Esc to go back{_R}\n\n  >"
-
-    elif menu == "project":
-        opts = "  " + "   ".join([_kw("v", "view summary"), _kw("l", "language")])
-        text = f"\n{title}\n\n{opts}\n\n  {_D}Esc to go back{_R}\n\n  >"
-
-    elif menu == "language":
-        current_lang = (context or {}).get("language", CURRENT_LANGUAGE)
-        lang_items = [
-            ("1", "c++"), ("2", "python"), ("3", "rust"),
-            ("4", "ocaml"), ("5", "go"), ("6", "typescript"),
-        ]
-        rows = []
-        for key_num, lang_name in lang_items:
-            if lang_name == current_lang:
-                rows.append(f"  {_B}[{key_num}]{_R} {_W}{lang_name}{_R}  {_D}←{_R}")
-            else:
-                rows.append(f"  {_B}[{key_num}]{_R} {lang_name}")
-        text = f"\n{title}\n\n" + "\n".join(rows) + f"\n\n  {_D}Esc to go back{_R}\n"
-
-    elif menu == "select_spec":
-        entries = state.get("spec_entries", [])
-        idx = state.get("spec_idx", 0)
-        rows = []
-        for i, entry in enumerate(entries):
-            name = entry.get("name", "?")
-            spec_file = entry.get("spec_file", f"specs/{name}.lean")
-            if i == idx:
-                rows.append(f"  {_B}→{_R} {_W}{name:<20}{_R}  {_D}{spec_file}{_R}")
-            else:
-                rows.append(f"    {name:<20}  {_D}{spec_file}{_R}")
-        text = (
-            f"\n{title}\n\n"
-            + "\n".join(rows)
-            + f"\n\n  {_D}↑↓ navigate   Enter select   Esc to go back{_R}\n\n"
+        stats = Text("    ")
+        stats.append(
+            f"{n_total} specs  ·  {n_types} types  ·  {n_functions} functions  ·  {language}",
+            style="dim",
         )
-
+        console.print(stats)
     else:
-        text = f"\n{title}\n"
+        console.print()
+        no_proj = Text("  ")
+        no_proj.append("◆ ", style="bold rgb(100,140,180)")
+        no_proj.append("new project", style="dim")
+        console.print(no_proj)
 
-    sys.stdout.write(text)
-    sys.stdout.flush()
-    return text.count("\n")
+    # Build menu line
+    items = [("e", "new spec")]
+    if has_context:
+        items += [("r", "rebuild"), ("p", "project")]
+    items += [("l", "language"), ("q", "quit")]
 
+    menu_text = Text("  ")
+    for i, (key, label) in enumerate(items):
+        if i > 0:
+            menu_text.append("   ", style="dim")
+        menu_text.append(f"[{key}]", style="rgb(100,140,180)")
+        menu_text.append(f" {label}", style="dim")
 
-def _transition(state: dict, key: str) -> str:
-    """
-    Update state["menu"] based on key.
-    Returns an action string: "continue", "quit", "open_editor", "edit_spec",
-    "show_project", "apply_language", "generate_main", "rebuild", "compile", "run".
-    """
-    menu = state["menu"]
-    has_context = state.get("context") is not None
+    console.print()
+    console.print(menu_text)
+    console.print()
 
-    if menu == "main":
-        if key in ("s", "S"):
-            state["menu"] = "specs"
-        elif key in ("c", "C") and has_context:
-            state["menu"] = "code"
-        elif key in ("p", "P") and has_context:
-            state["menu"] = "project"
-        elif key in ("q", "Q", "ESC", "\x03", "\x04"):
-            return "quit"
-
-    elif menu == "specs":
-        if key in ("e", "E"):
-            return "open_editor"
-        elif key in ("m", "M") and has_context:
-            entries = [
-                e for e in state["context"].get("functions", [])
-                if e.get("kind") != "demo"
-            ]
-            state["spec_entries"] = entries
-            state["spec_idx"] = 0
-            state["menu"] = "select_spec"
-        elif key in ("ESC", "\x03"):
-            state["menu"] = "main"
-
-    elif menu == "code":
-        if key in ("g", "G"):
-            return "generate_main"
-        elif key in ("r", "R"):
-            return "rebuild"
-        elif key in ("k", "K"):
-            return "compile"
-        elif key in ("x", "X"):
-            return "run"
-        elif key in ("ESC", "\x03"):
-            state["menu"] = "main"
-
-    elif menu == "project":
-        if key in ("v", "V"):
-            return "show_project"
-        elif key in ("l", "L"):
-            state["menu"] = "language"
-        elif key in ("ESC", "\x03"):
-            state["menu"] = "main"
-
-    elif menu == "language":
-        lang_map = {
-            "1": "c++", "2": "python", "3": "rust",
-            "4": "ocaml", "5": "go", "6": "typescript",
-        }
-        if key in lang_map:
-            state["selected_language"] = lang_map[key]
-            state["menu"] = "main"
-            return "apply_language"
-        elif key in ("ESC", "\x03"):
-            state["menu"] = "project"
-
-    elif menu == "select_spec":
-        entries = state.get("spec_entries", [])
-        n = len(entries)
-        if key == "\x1b[A" and n:
-            state["spec_idx"] = (state["spec_idx"] - 1) % n
-        elif key == "\x1b[B" and n:
-            state["spec_idx"] = (state["spec_idx"] + 1) % n
-        elif key in ("\r", "\n") and entries:
-            return "edit_spec"
-        elif key in ("ESC", "\x03"):
-            state["menu"] = "specs"
-
-    return "continue"
-
-
-# ---------------------------------------------------------------------------
-# Action handlers
-# ---------------------------------------------------------------------------
-
-def _action_edit(live_state: dict, project_dir: Path, stacked: bool) -> None:
-    """Open editor for a new spec, validate, and generate."""
-    tmp_spec = Path("/tmp/speccode_input.lean")
-    if not live_state.get("has_validation_errors"):
-        tmp_spec.write_text("", encoding="utf-8")
-
-    raw = run_once()
-    if raw is None:
-        live_state["has_validation_errors"] = False
-        live_state["menu"] = "specs"
-        return
-
-    content = _strip_error_header(raw)
-    if not content.strip():
-        live_state["has_validation_errors"] = False
-        live_state["menu"] = "specs"
-        return
-
-    ds = DisplayState()
-    result = validate_and_generate(content, ds, stacked, CURRENT_LANGUAGE)
-
-    if result == "invalid":
-        live_state["has_validation_errors"] = True
-        with ds._lock:
-            errors = list(ds.validation_errors)
-        _inject_errors_into_file(tmp_spec, content, errors)
-    else:
-        live_state["has_validation_errors"] = False
-        live_state["context"] = load_context(project_dir)
-
-    live_state["menu"] = "specs"
-
-
-def _action_edit_spec(live_state: dict, project_dir: Path) -> None:
-    """Open editor on the selected spec, update hash if changed."""
-    entries = live_state.get("spec_entries", [])
-    idx = live_state.get("spec_idx", 0)
-    if not entries or idx >= len(entries):
-        live_state["menu"] = "specs"
-        return
-
-    entry = entries[idx]
-    fn_name = entry.get("name", "")
-    spec_file_path = project_dir / entry.get("spec_file", f"specs/{fn_name}.lean")
-
-    editor = os.environ.get("EDITOR", "nano")
-    try:
-        subprocess.run([editor, str(spec_file_path)])
-    except FileNotFoundError:
-        console.print(f"  [red]Editor not found: {editor}[/red]")
-        live_state["menu"] = "specs"
-        return
-
-    if not spec_file_path.exists():
-        live_state["menu"] = "specs"
-        return
-
-    new_content = spec_file_path.read_text(encoding="utf-8")
-    new_hash = hashlib.sha256(new_content.encode()).hexdigest()[:8]
-    old_hash = entry.get("spec_hash", "")
-
-    if new_hash != old_hash:
-        ctx2 = load_context(project_dir)
-        if ctx2:
-            for fn in ctx2.get("functions", []):
-                if fn.get("name") == fn_name:
-                    fn["spec_hash"] = new_hash
-                    fn["stale"] = True
-                    break
-            save_context(project_dir, ctx2)
-        live_state["context"] = load_context(project_dir)
-        console.print("  [yellow]spec updated — run [r] to rebuild[/yellow]")
-
-    live_state["menu"] = "specs"
-
-
-def _action_show_project(live_state: dict, project_dir: Path) -> None:
-    """Display project summary, wait for keypress."""
-    context = live_state.get("context")
-    if not context:
-        live_state["menu"] = "main"
-        return
-
-    lines = [f"  [bold]Project:[/bold] {context.get('project', project_dir.name)}"]
-    lines.append(f"  Language: {context.get('language', '?')}")
-    lines.append("")
-    all_entries = context.get("functions", [])
-    type_entries = [e for e in all_entries if e.get("kind") == "type"]
-    fn_entries = [e for e in all_entries if e.get("kind", "function") == "function"]
-    if type_entries:
-        lines.append(f"  [dim]Types ({len(type_entries)})[/dim]")
-        for fn in type_entries:
-            lines.append(
-                f"  [rgb(100,140,180)]{fn['name']}[/rgb(100,140,180)]"
-                f"         {fn.get('spec_file', '?')}"
-            )
-        lines.append("")
-    if fn_entries:
-        lines.append(f"  [dim]Functions ({len(fn_entries)})[/dim]")
-    for fn in fn_entries:
-        thms = ", ".join(fn.get("theorems", [])) or "—"
-        lines.append(f"  [rgb(100,140,180)]{fn['name']}[/rgb(100,140,180)]")
-        lines.append(f"    spec: {fn.get('spec_file', '?')}")
-        lines.append(f"    theorems: {thms}")
-        lines.append(f"    generated: {fn.get('generated_at', '?')}")
-    specs_md_path = project_dir / "SPECS.md"
-    lines.append("")
-    if specs_md_path.exists():
-        lines.append("  [green]SPECS.md up to date[/green]")
-    else:
-        lines.append("  [yellow]SPECS.md missing — regenerate with [r][/yellow]")
-
-    console.print(Panel(
-        "\n".join(lines),
-        title="[bold]Project Summary[/bold]",
-        border_style="rgb(100,140,180)",
-    ))
-    console.print("  [dim]Press any key to continue...[/dim]")
-    _read_key_safe()
-    live_state["menu"] = "main"
-
-
-def _action_generate_main(state: dict, project_dir: Path, stacked: bool) -> None:
-    """Stream generate_main in its own Live display."""
-    context = state.get("context")
-    if not context:
-        state["menu"] = "main"
-        return
-
-    lang = context.get("language", CURRENT_LANGUAGE)
-    cfg_obj = LANGUAGE_CONFIGS.get(lang, LANGUAGE_CONFIGS["c++"])
-
-    ds = DisplayState()
-    with ds._lock:
-        ds.validation_state = "valid"
-        ds.lang_fence = LANG_FENCE.get(lang, "cpp")
-        ds.fn_name = "main"
-    ds.handle_event("generating", {})
-
-    done = threading.Event()
-
-    def _run():
+    while True:
+        console.print("  [rgb(100,140,180)]>[/rgb(100,140,180)] ", end="")
         try:
-            def on_chunk(chunk: str):
-                ds.handle_event("streaming", {"chunk": chunk})
-            code = generate_main(context, project_dir, target_language=lang, on_chunk=on_chunk)
-            ds.handle_event("done", {
-                "code": code,
-                "fn_name": "main",
-                "src_file": str(project_dir / f"src/main{cfg_obj['ext']}"),
-                "spec_file": "",
-                "cost": {"cost_total": 0.0, "codestral_tokens": 0},
-                "lang_fence": LANG_FENCE.get(lang, "cpp"),
-                "lang_ext": cfg_obj["ext"],
-                "output_dir": str(project_dir),
-            })
-        except Exception as e:
-            ds.handle_event("error", {"message": str(e)})
-        done.set()
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    with Live(_Renderable(ds, stacked), console=console, refresh_per_second=15, transient=False) as live:
-        done.wait()
-        live.update(build_renderable(ds, stacked))
-    t.join()
-    time.sleep(1.5)
-    state["context"] = load_context(project_dir)
-    state["menu"] = "main"
+            key = _read_key()
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            return "quit"
+        console.print()
+        if key in ("e", "E", "\r", "\n"):
+            return "edit"
+        if key in ("l", "L"):
+            return "language"
+        if key in ("p", "P") and has_context:
+            return "project"
+        if key in ("r", "R") and has_context:
+            return "rebuild"
+        if key in ("q", "Q", "\x03", "\x04"):  # q, Ctrl+C, Ctrl+D
+            return "quit"
+        # unknown key: reshow prompt only
 
 
-def _action_rebuild(state: dict, project_dir: Path, stacked: bool) -> None:
-    """Rebuild all specs, each in its own Live display."""
-    context = state.get("context")
-    if not context:
-        state["menu"] = "main"
-        return
+def _prompt_language() -> str:
+    """
+    Display language selection sub-menu.
+    Returns the selected language key.
+    """
+    lang_map = {
+        "1": "c++",
+        "2": "python",
+        "3": "rust",
+        "4": "ocaml",
+        "5": "go",
+        "6": "typescript",
+    }
 
-    lang = CURRENT_LANGUAGE
-    functions = [f for f in context.get("functions", []) if f.get("kind") != "demo"]
+    console.print()
+    console.print("  Select output language:")
+    console.print("  [1] c++        [2] python")
+    console.print("  [3] rust       [4] ocaml")
+    console.print("  [5] go         [6] typescript")
+    console.print()
 
-    for fn in functions:
-        fn_name = fn["name"]
-        spec_path = project_dir / fn.get("spec_file", f"specs/{fn_name}.lean")
-        if not spec_path.exists():
-            continue
-        spec_content = spec_path.read_text(encoding="utf-8")
-
-        ds = DisplayState()
-        with ds._lock:
-            ds.validation_state = "valid"
-            ds.spec_lines = spec_content.splitlines()
-            ds.lang_fence = LANG_FENCE.get(lang, "cpp")
-            ds.fn_name = fn_name
-        ds.handle_event("generating", {})
-
-        done = threading.Event()
-
-        def _run(_spec=spec_content, _ds=ds, _done=done):
-            run_pipeline(_spec, on_event=_ds.handle_event,
-                         target_language=lang, project_dir=project_dir)
-            _done.set()
-
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
-        with Live(_Renderable(ds, stacked), console=console, refresh_per_second=15, transient=False) as live:
-            done.wait()
-            live.update(build_renderable(ds, stacked))
-        t.join()
-        time.sleep(0.5)
-
-    state["context"] = load_context(project_dir)
-    state["menu"] = "main"
+    while True:
+        console.print("  > ", end="")
+        try:
+            key = _read_key()
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            return "c++"
+        console.print()
+        if key in lang_map:
+            return lang_map[key]
+        # unknown key: reshow prompt only
 
 
 # ---------------------------------------------------------------------------
@@ -930,6 +597,37 @@ def run_once() -> str | None:
 
     return tmp.read_text(encoding="utf-8") if tmp.exists() else ""
 
+
+def generate(spec: str, state: DisplayState, stacked: bool, language: str = "c++") -> None:
+    """Generation phase: streaming output with live display."""
+    with state._lock:
+        state.spec_lines = spec.splitlines()
+        state.lang_fence = LANG_FENCE.get(language, "cpp")
+
+    pipeline_done = threading.Event()
+
+    def pipeline_thread():
+        run_pipeline(
+            spec,
+            on_event=state.handle_event,
+            target_language=language,
+            project_dir=Path.cwd(),
+        )
+        pipeline_done.set()
+
+    t = threading.Thread(target=pipeline_thread, daemon=True)
+    t.start()
+
+    with Live(
+        _Renderable(state, stacked),
+        console=console,
+        refresh_per_second=15,
+        transient=False,
+    ) as live:
+        pipeline_done.wait()
+        live.update(build_renderable(state, stacked))  # final frame
+
+    t.join()
 
 
 def validate_and_generate(content: str, state: DisplayState, stacked: bool, language: str) -> str:
@@ -1003,6 +701,7 @@ def validate_and_generate(content: str, state: DisplayState, stacked: bool, lang
 def main():
     global CURRENT_LANGUAGE
 
+    # Check prerequisites before anything
     err = check_prerequisites()
     if err:
         console.print(Panel(
@@ -1012,78 +711,148 @@ def main():
         ))
         sys.exit(1)
 
+    # Determine layout
     _, rows = shutil.get_terminal_size()
     stacked = rows > 40
 
     _print_intro()
 
+    # Load project context
     project_dir = Path.cwd()
     context = load_context(project_dir)
-    if context:
-        CURRENT_LANGUAGE = context.get("language", CURRENT_LANGUAGE)
 
-    state: dict = {
-        "menu": "main",
-        "context": context,
-        "project_dir": project_dir,
-        "spec_idx": 0,
-        "spec_entries": [],
-        "has_validation_errors": False,
-        "stacked": stacked,
-    }
-
-    last_n = 0
+    next_action: str | None = None
+    has_validation_errors = False
 
     try:
         while True:
-            if last_n > 0:
-                clear_lines(last_n)
-            last_n = print_menu(state)
-
-            key = _read_key_safe()
-            action = _transition(state, key)
+            if next_action is None:
+                action = render_menu(project_dir)
+            else:
+                action, next_action = next_action, None
 
             if action == "quit":
-                clear_lines(last_n)
-                last_n = 0
                 break
 
-            elif action == "open_editor":
-                clear_lines(last_n)
-                last_n = 0
-                _action_edit(state, project_dir, stacked)
+            if action == "language":
+                CURRENT_LANGUAGE = _prompt_language()
+                continue
 
-            elif action == "edit_spec":
-                clear_lines(last_n)
-                last_n = 0
-                _action_edit_spec(state, project_dir)
+            if action == "project":
+                context = load_context(project_dir)
+                if context:
+                    lines = [f"  [bold]Project:[/bold] {context.get('project', project_dir.name)}"]
+                    lines.append(f"  Language: {context.get('language', '?')}")
+                    lines.append("")
+                    all_entries = context.get("functions", [])
+                    type_entries = [e for e in all_entries if e.get("kind") == "type"]
+                    fn_entries = [e for e in all_entries if e.get("kind", "function") == "function"]
+                    if type_entries:
+                        lines.append(f"  [dim]Types ({len(type_entries)})[/dim]")
+                        for fn in type_entries:
+                            lines.append(
+                                f"  [rgb(100,140,180)]{fn['name']}[/rgb(100,140,180)]"
+                                f"         {fn.get('spec_file', '?')}"
+                            )
+                        lines.append("")
+                    if fn_entries:
+                        lines.append(f"  [dim]Functions ({len(fn_entries)})[/dim]")
+                    for fn in fn_entries:
+                        thms = ", ".join(fn.get("theorems", [])) or "—"
+                        lines.append(f"  [rgb(100,140,180)]{fn['name']}[/rgb(100,140,180)]")
+                        lines.append(f"    spec: {fn.get('spec_file', '?')}")
+                        lines.append(f"    theorems: {thms}")
+                        lines.append(f"    generated: {fn.get('generated_at', '?')}")
+                    specs_md_path = project_dir / "SPECS.md"
+                    if specs_md_path.exists():
+                        lines.append("")
+                        lines.append("  [green]SPECS.md up to date[/green]")
+                    else:
+                        lines.append("")
+                        lines.append("  [yellow]SPECS.md missing — regenerate with [r][/yellow]")
+                    from rich.panel import Panel as _Panel
+                    console.print(_Panel(
+                        "\n".join(lines),
+                        title="[bold]Project Summary[/bold]",
+                        border_style="rgb(100,140,180)",
+                    ))
+                continue
 
-            elif action == "show_project":
-                clear_lines(last_n)
-                last_n = 0
-                _action_show_project(state, project_dir)
+            if action == "rebuild":
+                context = load_context(project_dir)
+                if not context:
+                    console.print("  [yellow]No context found.[/yellow]")
+                    continue
+                functions = context.get("functions", [])
+                console.print(f"  [rgb(100,140,180)]Rebuilding {len(functions)} function(s)...[/rgb(100,140,180)]")
+                for fn in functions:
+                    fn_name = fn["name"]
+                    spec_path = project_dir / fn.get("spec_file", f"specs/{fn_name}.lean")
+                    if not spec_path.exists():
+                        console.print(f"  [yellow]skip {fn_name}: spec not found[/yellow]")
+                        continue
+                    console.print(f"  [dim]→ {fn_name}[/dim]")
+                    spec_content = spec_path.read_text(encoding="utf-8")
+                    state = DisplayState()
+                    validate_and_generate(spec_content, state, stacked, CURRENT_LANGUAGE)
+                context = load_context(project_dir)
+                emit_ctx = {"fn_count": len(context.get("functions", [])) if context else 0}
+                console.print(f"  [green]✓ rebuild done — {emit_ctx['fn_count']} function(s)[/green]")
+                continue
 
-            elif action == "apply_language":
-                CURRENT_LANGUAGE = state.pop("selected_language", CURRENT_LANGUAGE)
+            # action == "edit"
+            tmp_spec = Path("/tmp/speccode_input.lean")
 
-            elif action == "generate_main":
-                clear_lines(last_n)
-                last_n = 0
-                _action_generate_main(state, project_dir, stacked)
+            # A. Prepare the temp file: empty for new specs,
+            #    or keep as-is (errors already injected) for validation retries.
+            if not has_validation_errors:
+                tmp_spec.write_text("", encoding="utf-8")
 
-            elif action == "rebuild":
-                clear_lines(last_n)
-                last_n = 0
-                _action_rebuild(state, project_dir, stacked)
+            # Open editor, read raw content
+            raw = run_once()
+            if raw is None:
+                has_validation_errors = False
+                continue  # editor not found — back to menu
 
-            elif action in ("compile", "run"):
-                pass  # not yet implemented
+            # B. Strip header comments; if nothing remains, back to menu
+            content = _strip_error_header(raw)
+            if not content.strip():
+                has_validation_errors = False
+                console.print("[yellow]No input.[/yellow]")
+                continue
 
-            # "continue" — redraw at top of loop
+            # C/D. Show spec with "validating..." then validate and optionally generate
+            state = DisplayState()
+            result = validate_and_generate(content, state, stacked, CURRENT_LANGUAGE)
+
+            # E. Invalid — show full menu; inject errors if user chooses to edit
+            if result == "invalid":
+                has_validation_errors = True
+                with state._lock:
+                    errors = list(state.validation_errors)
+
+                action = render_menu(project_dir)
+                if action == "edit":
+                    _inject_errors_into_file(tmp_spec, content, errors)
+                    next_action = "edit"
+                elif action == "language":
+                    CURRENT_LANGUAGE = _prompt_language()
+                    _inject_errors_into_file(tmp_spec, content, errors)
+                    next_action = "edit"
+                elif action == "quit":
+                    has_validation_errors = False
+                    next_action = "quit"
+                else:
+                    next_action = action  # project or rebuild — pass through
+                continue
+
+            # F. Valid — pipeline ran (done or error); show full menu
+            has_validation_errors = False
+            context = load_context(project_dir)
+            next_action = render_menu(project_dir)
 
     except KeyboardInterrupt:
-        if last_n > 0:
-            clear_lines(last_n)
+        pass
 
     console.print("\n[dim]Bye.[/dim]")
     sys.exit(0)

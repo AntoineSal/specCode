@@ -516,85 +516,168 @@ def _print_intro() -> None:
     console.print()
 
 
-def render_menu(project_dir: Path) -> str:
-    """
-    Load context, display project header + menu, wait for a keypress.
-    Returns: 'edit', 'modify', 'generate_main', 'language', 'project', 'rebuild', or 'quit'.
-    Updates CURRENT_LANGUAGE from context if available.
-    """
-    global CURRENT_LANGUAGE
-
-    context = load_context(project_dir)
-    has_context = context is not None
-
-    if has_context:
-        CURRENT_LANGUAGE = context.get("language", CURRENT_LANGUAGE)
-        project_name = context.get("project", project_dir.name)
-        all_entries = context.get("functions", [])
-        n_total = len(all_entries)
-        n_types = sum(1 for e in all_entries if e.get("kind") == "type")
-        n_functions = n_total - n_types
-        language = context.get("language", CURRENT_LANGUAGE)
-
-        console.print()
-        header = Text("  ")
-        header.append("◆ ", style="bold rgb(100,140,180)")
-        header.append(project_name, style="bold bright_white")
-        console.print(header)
-
-        stats = Text("    ")
-        stats.append(
-            f"{n_total} specs  ·  {n_types} types  ·  {n_functions} functions  ·  {language}",
-            style="dim",
-        )
-        console.print(stats)
-    else:
-        console.print()
-        no_proj = Text("  ")
-        no_proj.append("◆ ", style="bold rgb(100,140,180)")
-        no_proj.append("new project", style="dim")
-        console.print(no_proj)
-
-    # Build menu line
-    items = [("e", "new spec")]
-    if has_context:
-        items += [("m", "modify spec"), ("r", "rebuild"), ("g", "generate main"), ("p", "project")]
-    items += [("l", "language"), ("q", "quit")]
-
+def _menu_line(items: list[tuple[str, str]]) -> None:
+    """Print a sub-menu line from (key, label) pairs."""
     menu_text = Text("  ")
     for i, (key, label) in enumerate(items):
         if i > 0:
             menu_text.append("   ", style="dim")
         menu_text.append(f"[{key}]", style="rgb(100,140,180)")
         menu_text.append(f" {label}", style="dim")
-
     console.print()
     console.print(menu_text)
     console.print()
 
+
+def _menu_prompt() -> str:
+    """Print the prompt and return one keypress (via readchar)."""
+    import readchar
+    console.print("  [rgb(100,140,180)]>[/rgb(100,140,180)] ", end="")
+    key = readchar.readkey()
+    console.print()
+    return key
+
+
+def _menu_specs(has_context: bool) -> str | None:
+    """[s] specs sub-menu. Returns action or None for back."""
+    items = [("e", "new"), ("m", "modify"), ("←", "back")]
+    if not has_context:
+        items = [("e", "new"), ("←", "back")]
+    _menu_line(items)
     while True:
-        console.print("  [rgb(100,140,180)]>[/rgb(100,140,180)] ", end="")
-        try:
-            key = _read_key()
-        except (EOFError, KeyboardInterrupt):
-            console.print()
-            return "quit"
-        console.print()
-        if key in ("e", "E", "\r", "\n"):
+        key = _menu_prompt()
+        if key in ("e", "E"):
             return "edit"
         if key in ("m", "M") and has_context:
             return "modify"
-        if key in ("r", "R") and has_context:
-            return "rebuild"
-        if key in ("g", "G") and has_context:
+        if key in ("\x1b", "\x03", "\x04") or key in ("\x1b[D",):  # Esc / left arrow
+            return None
+        if key == "q":
+            return None
+
+
+def _menu_code() -> str | None:
+    """[c] code sub-menu. Returns action or None for back."""
+    _menu_line([("g", "generate main"), ("r", "rebuild"), ("k", "compile"), ("x", "run"), ("←", "back")])
+    while True:
+        key = _menu_prompt()
+        if key in ("g", "G"):
             return "generate_main"
-        if key in ("p", "P") and has_context:
+        if key in ("r", "R"):
+            return "rebuild"
+        if key in ("k", "K"):
+            return "compile"
+        if key in ("x", "X"):
+            return "run"
+        if key in ("\x1b", "\x03", "\x04") or key in ("\x1b[D",):
+            return None
+        if key == "q":
+            return None
+
+
+def _menu_project() -> str | None:
+    """[p] project sub-menu. Returns action or None for back."""
+    _menu_line([("v", "view summary"), ("l", "language"), ("←", "back")])
+    while True:
+        key = _menu_prompt()
+        if key in ("v", "V"):
             return "project"
         if key in ("l", "L"):
             return "language"
-        if key in ("q", "Q", "\x03", "\x04"):  # q, Ctrl+C, Ctrl+D
-            return "quit"
-        # unknown key: reshow prompt only
+        if key in ("\x1b", "\x03", "\x04") or key in ("\x1b[D",):
+            return None
+        if key == "q":
+            return None
+
+
+def render_menu(project_dir: Path) -> str:
+    """
+    Hierarchical main menu → sub-menus.
+    Returns: 'edit', 'modify', 'generate_main', 'rebuild', 'compile', 'run',
+             'language', 'project', or 'quit'.
+    """
+    global CURRENT_LANGUAGE
+
+    while True:
+        context = load_context(project_dir)
+        has_context = context is not None
+
+        if has_context:
+            CURRENT_LANGUAGE = context.get("language", CURRENT_LANGUAGE)
+            project_name = context.get("project", project_dir.name)
+            all_entries = context.get("functions", [])
+            n_total = len(all_entries)
+            n_types = sum(1 for e in all_entries if e.get("kind") == "type")
+            n_functions = n_total - n_types
+            language = context.get("language", CURRENT_LANGUAGE)
+
+            console.print()
+            header = Text("  ")
+            header.append("◆ ", style="bold rgb(100,140,180)")
+            header.append(project_name, style="bold bright_white")
+            console.print(header)
+
+            stats = Text("    ")
+            stats.append(
+                f"{n_total} specs  ·  {n_types} types  ·  {n_functions} functions  ·  {language}",
+                style="dim",
+            )
+            console.print(stats)
+        else:
+            console.print()
+            no_proj = Text("  ")
+            no_proj.append("◆ ", style="bold rgb(100,140,180)")
+            no_proj.append("new project", style="dim")
+            console.print(no_proj)
+
+        # Main menu
+        main_items = [("s", "specs")]
+        if has_context:
+            main_items += [("c", "code"), ("p", "project")]
+        main_items += [("q", "quit")]
+
+        menu_text = Text("  ")
+        for i, (k, label) in enumerate(main_items):
+            if i > 0:
+                menu_text.append("   ", style="dim")
+            menu_text.append(f"[{k}]", style="rgb(100,140,180)")
+            menu_text.append(f" {label}", style="dim")
+
+        console.print()
+        console.print(menu_text)
+        console.print()
+
+        # Key loop for main menu
+        while True:
+            console.print("  [rgb(100,140,180)]>[/rgb(100,140,180)] ", end="")
+            try:
+                key = _read_key()
+            except (EOFError, KeyboardInterrupt):
+                console.print()
+                return "quit"
+            console.print()
+
+            if key in ("s", "S"):
+                result = _menu_specs(has_context)
+                if result is not None:
+                    return result
+                break  # back → redraw main menu
+
+            if key in ("c", "C") and has_context:
+                result = _menu_code()
+                if result is not None:
+                    return result
+                break
+
+            if key in ("p", "P") and has_context:
+                result = _menu_project()
+                if result is not None:
+                    return result
+                break
+
+            if key in ("q", "Q", "\x03", "\x04"):
+                return "quit"
+            # unknown key: re-show prompt
 
 
 def _prompt_language() -> str:
@@ -790,6 +873,9 @@ def main():
 
             if action == "quit":
                 break
+
+            if action in ("compile", "run"):
+                continue  # not yet implemented
 
             if action == "language":
                 CURRENT_LANGUAGE = _prompt_language()

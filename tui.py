@@ -521,15 +521,14 @@ def render_menu(project_dir: Path) -> str:
     console.print()
     console.print(menu_text)
     console.print()
+    console.print("  [dim]press a key[/dim]")
+    console.print()
 
     while True:
-        console.print("  [rgb(100,140,180)]>[/rgb(100,140,180)] ", end="")
         try:
             key = _read_key()
         except (EOFError, KeyboardInterrupt):
-            console.print()
             return "quit"
-        console.print()
         if key in ("e", "E", "\r", "\n"):
             return "edit"
         if key in ("m", "M") and has_context:
@@ -542,7 +541,7 @@ def render_menu(project_dir: Path) -> str:
             return "rebuild"
         if key in ("q", "Q", "\x03", "\x04"):  # q, Ctrl+C, Ctrl+D
             return "quit"
-        # unknown key: reshow prompt only
+        # unknown key: wait for next
 
 
 def _prompt_language() -> str:
@@ -583,8 +582,8 @@ def _prompt_language() -> str:
 # Modify spec action
 # ---------------------------------------------------------------------------
 
-def _read_key_nav() -> str:
-    """Read one key, returning full ANSI sequence for arrow keys."""
+def _read_key_safe() -> str:
+    """Read one keypress; returns full ANSI sequence for arrows, 'ESC' for bare Esc."""
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
@@ -604,6 +603,22 @@ def _read_key_nav() -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
+def _build_spec_list(entries: list, idx: int) -> Panel:
+    content = Text()
+    content.append("  select spec to modify\n\n", style="dim")
+    for j, entry in enumerate(entries):
+        name = entry.get("name", "?")
+        spec_file = entry.get("spec_file", f"specs/{name}.lean")
+        if j == idx:
+            content.append("  → ", style="rgb(100,140,180) bold")
+            content.append(f"{name:<20}", style="bright_white")
+            content.append(f"  {spec_file}\n", style="dim")
+        else:
+            content.append(f"    {name:<20}  {spec_file}\n", style="dim")
+    content.append("\n  ↑↓   Enter select   q cancel", style="dim")
+    return Panel(content, border_style="dim")
+
+
 def _action_modify_spec(context: dict, project_dir: Path) -> None:
     """Show navigable spec list, open editor on selection, update hash."""
     entries = [e for e in context.get("functions", []) if e.get("kind") != "demo"]
@@ -613,50 +628,29 @@ def _action_modify_spec(context: dict, project_dir: Path) -> None:
 
     idx = 0
 
-    def _build_panel(i: int) -> Panel:
-        content = Text()
-        content.append("  select spec to modify\n\n", style="dim")
-        for j, entry in enumerate(entries):
-            name = entry.get("name", "?")
-            spec_file = entry.get("spec_file", f"specs/{name}.lean")
-            if j == i:
-                content.append("  → ", style="rgb(100,140,180) bold")
-                content.append(f"{name:<20}", style="bright_white")
-                content.append(f"  {spec_file}\n", style="dim")
-            else:
-                content.append(f"    {name:<20}  {spec_file}\n", style="dim")
-        content.append("\n  ↑↓ navigate   Enter select   Esc cancel", style="dim")
-        return Panel(content, border_style="dim")
-
-    selected = None
-    with Live(_build_panel(idx), console=console, refresh_per_second=4) as live:
+    with Live(_build_spec_list(entries, idx), console=console, refresh_per_second=10) as live:
         while True:
-            key = _read_key_nav()
-            n = len(entries)
-            if key == "\x1b[A":
-                idx = (idx - 1) % n
-                live.update(_build_panel(idx))
-            elif key == "\x1b[B":
-                idx = (idx + 1) % n
-                live.update(_build_panel(idx))
-            elif key in ("\r", "\n"):
-                selected = entries[idx]
+            live.update(_build_spec_list(entries, idx))
+            key = _read_key_safe()
+            if key in ("\x1b[A", "k"):
+                idx = (idx - 1) % len(entries)
+            elif key in ("\x1b[B", "j"):
+                idx = (idx + 1) % len(entries)
+            elif key == "\r":
                 break
-            elif key in ("ESC", "q", "Q", "\x03"):
-                return
+            elif key in ("q", "Q", "ESC", "\x03"):
+                idx = -1
+                break
 
-    if selected is None:
+    if idx == -1:
         return
 
-    fn_name = selected.get("name", "")
-    spec_path = project_dir / selected.get("spec_file", f"specs/{fn_name}.lean")
-
+    spec_path = project_dir / entries[idx].get("spec_file", f"specs/{entries[idx]['name']}.lean")
     if not spec_path.exists():
         console.print(f"  [red]Spec file not found: {spec_path}[/red]")
         return
 
     editor = os.environ.get("EDITOR", "nano")
-    console.print("[dim]Opening editor... (save and close to continue)[/dim]")
     try:
         subprocess.run([editor, str(spec_path)])
     except FileNotFoundError:
@@ -669,11 +663,17 @@ def _action_modify_spec(context: dict, project_dir: Path) -> None:
     new_content = spec_path.read_text(encoding="utf-8")
     new_hash = hashlib.sha256(new_content.encode()).hexdigest()[:8]
 
-    if new_hash != selected.get("spec_hash", ""):
-        selected["spec_hash"] = new_hash
-        selected["stale"] = True
+    context = load_context(project_dir)
+    if context:
+        for fn in context.get("functions", []):
+            if fn["name"] == entries[idx]["name"]:
+                fn["spec_hash"] = new_hash
+                fn["stale"] = True
+                break
         save_context(project_dir, context)
-        console.print("  [yellow]spec updated — run [r] to rebuild[/yellow]")
+
+    console.print("  [green]✓ spec updated — run [r] to rebuild[/green]")
+    time.sleep(1.5)
 
 
 # ---------------------------------------------------------------------------

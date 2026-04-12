@@ -466,16 +466,20 @@ def _print_intro() -> None:
     console.print()
 
 
+_menu_line_count: int = 0
+
+
 def render_menu(project_dir: Path) -> str:
     """
     Load context, display project header + menu, wait for a keypress.
     Returns: 'edit', 'language', 'project', 'rebuild', or 'quit'.
     Updates CURRENT_LANGUAGE from context if available.
     """
-    global CURRENT_LANGUAGE
+    global CURRENT_LANGUAGE, _menu_line_count
 
     context = load_context(project_dir)
     has_context = context is not None
+    n = 0
 
     if has_context:
         CURRENT_LANGUAGE = context.get("language", CURRENT_LANGUAGE)
@@ -486,24 +490,24 @@ def render_menu(project_dir: Path) -> str:
         n_functions = n_total - n_types
         language = context.get("language", CURRENT_LANGUAGE)
 
-        console.print()
+        console.print(); n += 1
         header = Text("  ")
         header.append("◆ ", style="bold rgb(100,140,180)")
         header.append(project_name, style="bold bright_white")
-        console.print(header)
+        console.print(header); n += 1
 
         stats = Text("    ")
         stats.append(
             f"{n_total} specs  ·  {n_types} types  ·  {n_functions} functions  ·  {language}",
             style="dim",
         )
-        console.print(stats)
+        console.print(stats); n += 1
     else:
-        console.print()
+        console.print(); n += 1
         no_proj = Text("  ")
         no_proj.append("◆ ", style="bold rgb(100,140,180)")
         no_proj.append("new project", style="dim")
-        console.print(no_proj)
+        console.print(no_proj); n += 1
 
     # Build menu line
     items = [("e", "new spec")]
@@ -518,9 +522,11 @@ def render_menu(project_dir: Path) -> str:
         menu_text.append(f"[{key}]", style="rgb(100,140,180)")
         menu_text.append(f" {label}", style="dim")
 
-    console.print()
-    console.print(menu_text)
-    console.print()
+    console.print(); n += 1
+    console.print(menu_text); n += 1
+    console.print(); n += 1
+
+    _menu_line_count = n
 
     while True:
         try:
@@ -905,12 +911,18 @@ def main():
 
             if action == "language":
                 CURRENT_LANGUAGE = _prompt_language()
+                if _menu_line_count > 0:
+                    sys.stdout.write(f"\x1b[{_menu_line_count}A\x1b[0J")
+                    sys.stdout.flush()
                 continue
 
             if action == "modify":
                 context = load_context(project_dir)
                 if context:
                     _action_modify_spec(context, project_dir)
+                if _menu_line_count > 0:
+                    sys.stdout.write(f"\x1b[{_menu_line_count}A\x1b[0J")
+                    sys.stdout.flush()
                 continue
 
             if action == "project":

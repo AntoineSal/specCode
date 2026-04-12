@@ -614,7 +614,7 @@ def _prompt_language() -> str:
 
 def _read_key_safe() -> str:
     """Read one keypress via /dev/tty; returns arrow sequences or decoded char."""
-    with open("/dev/tty", "rb") as tty_f:
+    with open("/dev/tty", "rb", buffering=0) as tty_f:
         fd = tty_f.fileno()
         old = termios.tcgetattr(fd)
         try:

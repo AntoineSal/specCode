@@ -5,8 +5,10 @@ Terminal interface for the speccode pipeline.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -34,6 +36,7 @@ from orchestrator import (
     load_context,
     parse_spec,
     run_pipeline,
+    save_context,
 )
 
 console = Console()
@@ -505,7 +508,7 @@ def render_menu(project_dir: Path) -> str:
     # Build menu line
     items = [("e", "new spec")]
     if has_context:
-        items += [("r", "rebuild"), ("p", "project")]
+        items += [("m", "modify"), ("r", "rebuild"), ("p", "project")]
     items += [("l", "language"), ("q", "quit")]
 
     menu_text = Text("  ")
@@ -529,6 +532,8 @@ def render_menu(project_dir: Path) -> str:
         console.print()
         if key in ("e", "E", "\r", "\n"):
             return "edit"
+        if key in ("m", "M") and has_context:
+            return "modify"
         if key in ("l", "L"):
             return "language"
         if key in ("p", "P") and has_context:
@@ -572,6 +577,103 @@ def _prompt_language() -> str:
         if key in lang_map:
             return lang_map[key]
         # unknown key: reshow prompt only
+
+
+# ---------------------------------------------------------------------------
+# Modify spec action
+# ---------------------------------------------------------------------------
+
+def _read_key_nav() -> str:
+    """Read one key, returning full ANSI sequence for arrow keys."""
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            r, _, _ = select.select([sys.stdin], [], [], 0.05)
+            if r:
+                ch2 = sys.stdin.read(1)
+                if ch2 == "[":
+                    ch3 = sys.stdin.read(1)
+                    return "\x1b[" + ch3
+                return "\x1b" + ch2
+            return "ESC"
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _action_modify_spec(context: dict, project_dir: Path) -> None:
+    """Show navigable spec list, open editor on selection, update hash."""
+    entries = [e for e in context.get("functions", []) if e.get("kind") != "demo"]
+    if not entries:
+        console.print("  [yellow]No specs found.[/yellow]")
+        return
+
+    idx = 0
+
+    def _build_panel(i: int) -> Panel:
+        content = Text()
+        content.append("  select spec to modify\n\n", style="dim")
+        for j, entry in enumerate(entries):
+            name = entry.get("name", "?")
+            spec_file = entry.get("spec_file", f"specs/{name}.lean")
+            if j == i:
+                content.append("  → ", style="rgb(100,140,180) bold")
+                content.append(f"{name:<20}", style="bright_white")
+                content.append(f"  {spec_file}\n", style="dim")
+            else:
+                content.append(f"    {name:<20}  {spec_file}\n", style="dim")
+        content.append("\n  ↑↓ navigate   Enter select   Esc cancel", style="dim")
+        return Panel(content, border_style="dim")
+
+    selected = None
+    with Live(_build_panel(idx), console=console, refresh_per_second=4) as live:
+        while True:
+            key = _read_key_nav()
+            n = len(entries)
+            if key == "\x1b[A":
+                idx = (idx - 1) % n
+                live.update(_build_panel(idx))
+            elif key == "\x1b[B":
+                idx = (idx + 1) % n
+                live.update(_build_panel(idx))
+            elif key in ("\r", "\n"):
+                selected = entries[idx]
+                break
+            elif key in ("ESC", "q", "Q", "\x03"):
+                return
+
+    if selected is None:
+        return
+
+    fn_name = selected.get("name", "")
+    spec_path = project_dir / selected.get("spec_file", f"specs/{fn_name}.lean")
+
+    if not spec_path.exists():
+        console.print(f"  [red]Spec file not found: {spec_path}[/red]")
+        return
+
+    editor = os.environ.get("EDITOR", "nano")
+    console.print("[dim]Opening editor... (save and close to continue)[/dim]")
+    try:
+        subprocess.run([editor, str(spec_path)])
+    except FileNotFoundError:
+        console.print(f"  [red]Editor not found: {editor}[/red]")
+        return
+
+    if not spec_path.exists():
+        return
+
+    new_content = spec_path.read_text(encoding="utf-8")
+    new_hash = hashlib.sha256(new_content.encode()).hexdigest()[:8]
+
+    if new_hash != selected.get("spec_hash", ""):
+        selected["spec_hash"] = new_hash
+        selected["stale"] = True
+        save_context(project_dir, context)
+        console.print("  [yellow]spec updated — run [r] to rebuild[/yellow]")
 
 
 # ---------------------------------------------------------------------------
@@ -736,6 +838,12 @@ def main():
 
             if action == "language":
                 CURRENT_LANGUAGE = _prompt_language()
+                continue
+
+            if action == "modify":
+                context = load_context(project_dir)
+                if context:
+                    _action_modify_spec(context, project_dir)
                 continue
 
             if action == "project":

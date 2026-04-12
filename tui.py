@@ -487,23 +487,28 @@ def _read_key_safe() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Menu — ANSI line clearing + plain print approach
+# Menu — ANSI-based rendering, exact line counting
 # ---------------------------------------------------------------------------
 
-def clear_lines(n: int) -> None:
-    """Erase the last n lines printed to the terminal."""
-    for _ in range(n):
-        sys.stdout.write("\x1b[1A")  # move up one line
-        sys.stdout.write("\x1b[2K")  # erase that line
-    sys.stdout.flush()
+_B = "\x1b[38;2;100;140;180m"   # blue
+_W = "\x1b[97m"                  # bright white
+_D = "\x1b[2m"                   # dim
+_X = "\x1b[1m"                   # bold
+_R = "\x1b[0m"                   # reset
 
 
 def _kw(key: str, label: str) -> str:
-    return f"[rgb(100,140,180)][{key}][/rgb(100,140,180)] [dim]{label}[/dim]"
+    return f"{_B}[{key}]{_R}{_D} {label}{_R}"
+
+
+def clear_lines(n: int) -> None:
+    """Move up n lines and erase everything below — single atomic operation."""
+    sys.stdout.write(f"\x1b[{n}A\x1b[0J")
+    sys.stdout.flush()
 
 
 def print_menu(state: dict) -> int:
-    """Print the current menu state. Returns the number of lines printed."""
+    """Build menu as a plain ANSI string, print it, return exact line count."""
     menu = state["menu"]
     context = state.get("context")
     has_context = context is not None
@@ -516,10 +521,10 @@ def print_menu(state: dict) -> int:
         n_types = sum(1 for e in all_entries if e.get("kind") == "type")
         n_fns = n_total - n_types
         language = context.get("language", CURRENT_LANGUAGE)
-        stats_str = f"[dim]{n_total} specs  ·  {n_types} types  ·  {n_fns} fns  ·  {language}[/dim]"
+        stats = f"  {_D}{n_total} specs  ·  {n_types} types  ·  {n_fns} fns  ·  {language}{_R}"
     else:
         project_name = "new project"
-        stats_str = ""
+        stats = ""
 
     crumb_map: dict[str, list[str]] = {
         "specs":       ["specs"],
@@ -528,71 +533,35 @@ def print_menu(state: dict) -> int:
         "language":    ["project", "language"],
         "select_spec": ["specs", "modify"],
     }
-    title = (
-        f"  [bold rgb(100,140,180)]◆[/bold rgb(100,140,180)]"
-        f" [bold bright_white]{project_name}[/bold bright_white]"
-    )
+    title = f"  {_B}{_X}◆{_R} {_X}{_W}{project_name}{_R}"
     for crumb in crumb_map.get(menu, []):
-        title += f"  [dim]›  {crumb}[/dim]"
-
-    n = 0
-
-    def p(s: str = "") -> None:
-        nonlocal n
-        console.print(s)
-        n += 1
+        title += f"  {_D}›  {crumb}{_R}"
 
     if menu == "main":
-        p()
-        p(title)
-        p(f"    {stats_str}" if stats_str else "")
-        p()
         items = [_kw("s", "specs")]
         if has_context:
             items += [_kw("c", "code"), _kw("p", "project")]
         items.append(_kw("q", "quit"))
-        p("  " + "   ".join(items))
-        p()
-        p("  [dim]>[/dim]")
-        p()
-        p()
-        # 9 lines
+        opts = "  " + "   ".join(items)
+        text = f"\n{title}\n{stats}\n\n{opts}\n\n  {_D}>{_R}\n"
 
     elif menu == "specs":
-        p()
-        p(title)
-        p()
         items = [_kw("e", "new")]
         if has_context:
             items.append(_kw("m", "modify"))
-        p("  " + "   ".join(items))
-        p()
-        p("  [dim]Esc to go back[/dim]")
-        p()
-        # 7 lines
+        opts = "  " + "   ".join(items)
+        text = f"\n{title}\n\n{opts}\n\n  {_D}Esc to go back{_R}\n\n  {_D}>{_R}\n"
 
     elif menu == "code":
-        p()
-        p(title)
-        p()
-        p("  " + "   ".join([
+        opts = "  " + "   ".join([
             _kw("g", "generate main"), _kw("r", "rebuild"),
             _kw("k", "compile"), _kw("x", "run"),
-        ]))
-        p()
-        p("  [dim]Esc to go back[/dim]")
-        p()
-        # 7 lines
+        ])
+        text = f"\n{title}\n\n{opts}\n\n  {_D}Esc to go back{_R}\n\n  {_D}>{_R}\n"
 
     elif menu == "project":
-        p()
-        p(title)
-        p()
-        p("  " + "   ".join([_kw("v", "view summary"), _kw("l", "language")]))
-        p()
-        p("  [dim]Esc to go back[/dim]")
-        p()
-        # 7 lines
+        opts = "  " + "   ".join([_kw("v", "view summary"), _kw("l", "language")])
+        text = f"\n{title}\n\n{opts}\n\n  {_D}Esc to go back{_R}\n\n  {_D}>{_R}\n"
 
     elif menu == "language":
         current_lang = (context or {}).get("language", CURRENT_LANGUAGE)
@@ -600,40 +569,37 @@ def print_menu(state: dict) -> int:
             ("1", "c++"), ("2", "python"), ("3", "rust"),
             ("4", "ocaml"), ("5", "go"), ("6", "typescript"),
         ]
-        p()
-        p(title)
-        p()
+        rows = []
         for key_num, lang_name in lang_items:
             if lang_name == current_lang:
-                p(f"  [rgb(100,140,180)][{key_num}][/rgb(100,140,180)]"
-                  f" [bold bright_white]{lang_name}[/bold bright_white]  [dim]←[/dim]")
+                rows.append(f"  {_B}[{key_num}]{_R} {_X}{_W}{lang_name}{_R}  {_D}←{_R}")
             else:
-                p(f"  [rgb(100,140,180)][{key_num}][/rgb(100,140,180)] [dim]{lang_name}[/dim]")
-        p()
-        p("  [dim]Esc to go back[/dim]")
-        p()
-        # 12 lines
+                rows.append(f"  {_B}[{key_num}]{_R} {_D}{lang_name}{_R}")
+        text = f"\n{title}\n\n" + "\n".join(rows) + f"\n\n  {_D}Esc to go back{_R}\n"
 
     elif menu == "select_spec":
         entries = state.get("spec_entries", [])
         idx = state.get("spec_idx", 0)
-        p()
-        p(title)
-        p()
+        rows = []
         for i, entry in enumerate(entries):
             name = entry.get("name", "?")
             spec_file = entry.get("spec_file", f"specs/{name}.lean")
             if i == idx:
-                p(f"  [rgb(100,140,180) bold]→[/rgb(100,140,180) bold]"
-                  f" [bright_white]{name:<20}[/bright_white]  [dim]{spec_file}[/dim]")
+                rows.append(f"  {_B}{_X}→{_R} {_W}{name:<20}{_R}  {_D}{spec_file}{_R}")
             else:
-                p(f"    [dim]{name:<20}  {spec_file}[/dim]")
-        p()
-        p("  [dim]↑↓ navigate   Enter select   Esc to go back[/dim]")
-        p()
-        # 6 + len(entries) lines
+                rows.append(f"    {_D}{name:<20}  {spec_file}{_R}")
+        text = (
+            f"\n{title}\n\n"
+            + "\n".join(rows)
+            + f"\n\n  {_D}↑↓ navigate   Enter select   Esc to go back{_R}\n\n"
+        )
 
-    return n
+    else:
+        text = f"\n{title}\n"
+
+    sys.stdout.write(text)
+    sys.stdout.flush()
+    return text.count("\n")
 
 
 def _transition(state: dict, key: str) -> str:

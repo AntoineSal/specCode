@@ -8,7 +8,6 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-import select
 import shutil
 import subprocess
 import sys
@@ -77,91 +76,53 @@ def _read_key() -> str:
     return ch
 
 
-def _read_key_ext() -> str:
-    """Read a keypress; returns 'up', 'down', 'enter', 'esc', or the char."""
-    fd = sys.stdin.fileno()
-    try:
-        old = termios.tcgetattr(fd)
-    except termios.error:
-        line = sys.stdin.readline() or "\n"
-        return "enter" if line.strip() == "" else line[0]
-    try:
-        tty.setraw(fd)
-        ch = sys.stdin.read(1)
-        if ch == "\x1b":
-            if select.select([sys.stdin], [], [], 0.05)[0]:
-                ch2 = sys.stdin.read(1)
-                if ch2 == "[" and select.select([sys.stdin], [], [], 0.05)[0]:
-                    ch3 = sys.stdin.read(1)
-                    if ch3 == "A":
-                        return "up"
-                    elif ch3 == "B":
-                        return "down"
-            return "esc"
-        if ch in ("\r", "\n"):
-            return "enter"
-        return ch
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-
-def _clear_lines(n: int) -> None:
-    """Move cursor up n lines and clear each one."""
-    for _ in range(n):
-        sys.stdout.write("\033[A\033[2K")
-    sys.stdout.flush()
-
-
-def _select_spec(entries: list[dict]) -> dict | None:
+def select_spec(context: dict) -> str | None:
     """
-    Keyboard-navigable list of specs.
-    Returns selected entry dict, or None if the user pressed Esc.
+    Rich Live keyboard-navigable spec selector.
+    Returns the selected spec name, or None on Esc/q.
     """
+    import readchar
+
+    entries = [e for e in context.get("functions", []) if e.get("kind") != "demo"]
     if not entries:
         return None
 
     idx = 0
-    first_draw = True
-    # lines drawn: blank + title + blank + N entries + blank + hint + blank = N + 6
-    n_total = len(entries) + 6
 
-    while True:
-        if not first_draw:
-            _clear_lines(n_total)
-        first_draw = False
-
-        console.print()
-        console.print("  Select spec to modify:")
-        console.print()
+    def _render(current_idx: int):
+        lines = Text()
+        lines.append("\n  Select spec to modify:\n\n", style="bold")
         for i, entry in enumerate(entries):
             name = entry.get("name", "?")
             spec_file = entry.get("spec_file", f"specs/{name}.lean")
-            if i == idx:
-                line = Text("  ")
-                line.append("→ ", style="rgb(100,140,180) bold")
-                line.append(f"{name:<20}", style="rgb(100,140,180)")
-                line.append(f"  {spec_file}", style="dim")
+            if i == current_idx:
+                lines.append("  → ", style="rgb(100,140,180) bold")
+                lines.append(f"{name:<20}", style="bright_white")
+                lines.append(f"  {spec_file}\n", style="dim")
             else:
-                line = Text("    ")
-                line.append(f"{name:<20}", style="dim")
-                line.append(f"  {spec_file}", style="dim")
-            console.print(line)
-        console.print()
-        console.print("  [dim]↑↓ navigate   Enter select   Esc cancel[/dim]")
-        console.print()
+                lines.append(f"    {name:<20}", style="dim")
+                lines.append(f"  {spec_file}\n", style="dim")
+        lines.append("\n  ↑↓ navigate   Enter select   Esc cancel\n", style="dim")
+        return Panel(lines, border_style="dim")
 
-        key = _read_key_ext()
-
-        if key == "up":
-            idx = (idx - 1) % len(entries)
-        elif key == "down":
-            idx = (idx + 1) % len(entries)
-        elif key == "enter":
-            _clear_lines(n_total)
-            return entries[idx]
-        elif key == "esc":
-            _clear_lines(n_total)
-            return None
+    with Live(
+        _render(idx),
+        console=console,
+        refresh_per_second=10,
+        transient=True,
+    ) as live:
+        while True:
+            key = readchar.readkey()
+            if key == readchar.key.UP:
+                idx = (idx - 1) % len(entries)
+                live.update(_render(idx))
+            elif key == readchar.key.DOWN:
+                idx = (idx + 1) % len(entries)
+                live.update(_render(idx))
+            elif key in (readchar.key.ENTER, "\r", "\n"):
+                return entries[idx]["name"]
+            elif key in (readchar.key.ESC, "q", "\x03"):
+                return None
 
 
 # ---------------------------------------------------------------------------
@@ -900,15 +861,11 @@ def main():
                 context = load_context(project_dir)
                 if not context:
                     continue
-                entries = [e for e in context.get("functions", []) if e.get("kind") != "demo"]
-                if not entries:
-                    console.print("  [yellow]No specs found.[/yellow]")
+                fn_name = select_spec(context)
+                if fn_name is None:
                     continue
-                selected = _select_spec(entries)
-                if selected is None:
-                    continue
-                fn_name = selected["name"]
-                spec_file_path = project_dir / selected.get("spec_file", f"specs/{fn_name}.lean")
+                entry = next((e for e in context.get("functions", []) if e.get("name") == fn_name), None)
+                spec_file_path = project_dir / (entry.get("spec_file", f"specs/{fn_name}.lean") if entry else f"specs/{fn_name}.lean")
                 editor = os.environ.get("EDITOR", "nano")
                 console.print(f"  [dim]Opening {spec_file_path.name}...[/dim]")
                 try:
@@ -920,7 +877,7 @@ def main():
                     continue
                 new_content = spec_file_path.read_text(encoding="utf-8")
                 new_hash = hashlib.sha256(new_content.encode()).hexdigest()[:8]
-                old_hash = selected.get("spec_hash", "")
+                old_hash = entry.get("spec_hash", "") if entry else ""
                 if new_hash != old_hash:
                     ctx2 = load_context(project_dir)
                     if ctx2:

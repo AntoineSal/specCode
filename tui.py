@@ -77,55 +77,6 @@ def _read_key() -> str:
     return ch
 
 
-def select_spec(context: dict) -> str | None:
-    """
-    Rich Live keyboard-navigable spec selector.
-    Returns the selected spec name, or None on Esc/q.
-    """
-    import readchar
-
-    entries = [e for e in context.get("functions", []) if e.get("kind") != "demo"]
-    if not entries:
-        return None
-
-    idx = 0
-
-    def _render(current_idx: int):
-        lines = Text()
-        lines.append("\n  Select spec to modify:\n\n", style="bold")
-        for i, entry in enumerate(entries):
-            name = entry.get("name", "?")
-            spec_file = entry.get("spec_file", f"specs/{name}.lean")
-            if i == current_idx:
-                lines.append("  → ", style="rgb(100,140,180) bold")
-                lines.append(f"{name:<20}", style="bright_white")
-                lines.append(f"  {spec_file}\n", style="dim")
-            else:
-                lines.append(f"    {name:<20}", style="dim")
-                lines.append(f"  {spec_file}\n", style="dim")
-        lines.append("\n  ↑↓ navigate   Enter select   Esc cancel\n", style="dim")
-        return Panel(lines, border_style="dim")
-
-    with Live(
-        _render(idx),
-        console=console,
-        refresh_per_second=10,
-        transient=True,
-    ) as live:
-        while True:
-            key = readchar.readkey()
-            if key == readchar.key.UP:
-                idx = (idx - 1) % len(entries)
-                live.update(_render(idx))
-            elif key == readchar.key.DOWN:
-                idx = (idx + 1) % len(entries)
-                live.update(_render(idx))
-            elif key in (readchar.key.ENTER, "\r", "\n"):
-                return entries[idx]["name"]
-            elif key in (readchar.key.ESC, "q", "\x03"):
-                return None
-
-
 # ---------------------------------------------------------------------------
 # Prerequisite check (silent — called once at startup)
 # ---------------------------------------------------------------------------
@@ -536,147 +487,393 @@ def _read_key_safe() -> str:
     return ch
 
 
-def _submenu(items: list[tuple[str, str, str]]) -> str | None:
-    """
-    Display a static sub-menu with Rich Live (no scroll, no extra lines).
-    items: list of (key_char, label, action).
-    Returns action string, or None on Esc.
-    """
-    content = Text("\n  ")
-    for i, (key, label, _) in enumerate(items):
+# ---------------------------------------------------------------------------
+# Menu state machine
+# ---------------------------------------------------------------------------
+
+def _append_menu_items(content: Text, items: list[tuple[str, str]]) -> None:
+    content.append("  ")
+    for i, (key, label) in enumerate(items):
         if i > 0:
             content.append("   ")
         content.append(f"[{key}]", style="rgb(100,140,180)")
         content.append(f" {label}", style="dim")
-    content.append("\n\n  ")
-    content.append("Esc to go back", style="dim")
     content.append("\n")
-    panel = Panel(content, border_style="dim")
-
-    with Live(panel, console=console, refresh_per_second=10, transient=True):
-        while True:
-            key = _read_key_safe()
-            for k, _, action in items:
-                if key.lower() == k.lower():
-                    return action
-            if key in ("ESC", "\x03", "\x04"):
-                return None
 
 
-def _menu_specs(has_context: bool) -> str | None:
-    """[s] specs sub-menu."""
-    items = [("e", "new", "edit")]
+def _render_menu_state(live_state: dict) -> Panel:
+    """Build a Rich Panel for the current menu state."""
+    menu = live_state["menu"]
+    context = live_state.get("context")
+    has_context = context is not None
+    project_dir: Path = live_state["project_dir"]
+
     if has_context:
-        items.append(("m", "modify", "modify"))
-    return _submenu(items)
+        project_name = context.get("project", project_dir.name)
+        all_entries = context.get("functions", [])
+        n_total = len(all_entries)
+        n_types = sum(1 for e in all_entries if e.get("kind") == "type")
+        n_fns = n_total - n_types
+        language = context.get("language", CURRENT_LANGUAGE)
+        stats_str = f"{n_total} specs  ·  {n_types} types  ·  {n_fns} functions  ·  {language}"
+    else:
+        project_name = "new project"
+        stats_str = ""
 
+    breadcrumbs: dict[str, list[str]] = {
+        "main":        [],
+        "specs":       ["specs"],
+        "code":        ["code"],
+        "project":     ["project"],
+        "select_spec": ["specs", "modify"],
+    }
 
-def _menu_code() -> str | None:
-    """[c] code sub-menu."""
-    return _submenu([
-        ("g", "generate main", "generate_main"),
-        ("r", "rebuild",       "rebuild"),
-        ("k", "compile",       "compile"),
-        ("x", "run",           "run"),
-    ])
+    content = Text()
+    content.append("\n  ")
+    content.append("◆ ", style="bold rgb(100,140,180)")
+    content.append(project_name, style="bold bright_white")
+    for crumb in breadcrumbs.get(menu, []):
+        content.append("  ›  ", style="dim")
+        content.append(crumb, style="dim")
+    content.append("\n")
 
+    if menu == "main" and stats_str:
+        content.append(f"    {stats_str}\n", style="dim")
 
-def _menu_project() -> str | None:
-    """[p] project sub-menu."""
-    return _submenu([
-        ("v", "view summary", "project"),
-        ("l", "language",     "language"),
-    ])
+    content.append("\n")
 
-
-def render_menu(project_dir: Path) -> str:
-    """
-    Hierarchical main menu → sub-menus.
-    Returns: 'edit', 'modify', 'generate_main', 'rebuild', 'compile', 'run',
-             'language', 'project', or 'quit'.
-    """
-    global CURRENT_LANGUAGE
-
-    while True:
-        context = load_context(project_dir)
-        has_context = context is not None
-
+    if menu == "main":
+        items = [("s", "specs")]
         if has_context:
-            CURRENT_LANGUAGE = context.get("language", CURRENT_LANGUAGE)
-            project_name = context.get("project", project_dir.name)
-            all_entries = context.get("functions", [])
-            n_total = len(all_entries)
-            n_types = sum(1 for e in all_entries if e.get("kind") == "type")
-            n_functions = n_total - n_types
-            language = context.get("language", CURRENT_LANGUAGE)
+            items += [("c", "code"), ("p", "project")]
+        items += [("q", "quit")]
+        _append_menu_items(content, items)
 
-            console.print()
-            header = Text("  ")
-            header.append("◆ ", style="bold rgb(100,140,180)")
-            header.append(project_name, style="bold bright_white")
-            console.print(header)
+    elif menu == "specs":
+        items = [("e", "new")]
+        if has_context:
+            items.append(("m", "modify"))
+        _append_menu_items(content, items)
+        content.append("\n  ")
+        content.append("Esc to go back\n", style="dim")
 
-            stats = Text("    ")
-            stats.append(
-                f"{n_total} specs  ·  {n_types} types  ·  {n_functions} functions  ·  {language}",
-                style="dim",
+    elif menu == "code":
+        _append_menu_items(content, [
+            ("g", "generate main"), ("r", "rebuild"), ("k", "compile"), ("x", "run"),
+        ])
+        content.append("\n  ")
+        content.append("Esc to go back\n", style="dim")
+
+    elif menu == "project":
+        _append_menu_items(content, [("v", "view summary"), ("l", "language")])
+        content.append("\n  ")
+        content.append("Esc to go back\n", style="dim")
+
+    elif menu == "select_spec":
+        entries = live_state.get("spec_entries", [])
+        idx = live_state.get("spec_idx", 0)
+        for i, entry in enumerate(entries):
+            name = entry.get("name", "?")
+            spec_file = entry.get("spec_file", f"specs/{name}.lean")
+            if i == idx:
+                content.append("  → ", style="rgb(100,140,180) bold")
+                content.append(f"{name:<20}", style="bright_white")
+                content.append(f"  {spec_file}\n", style="dim")
+            else:
+                content.append(f"    {name:<20}", style="dim")
+                content.append(f"  {spec_file}\n", style="dim")
+        content.append("\n  ")
+        content.append("↑↓ navigate   Enter select   Esc to go back\n", style="dim")
+
+    content.append("\n")
+    return Panel(content, border_style="dim")
+
+
+def _transition(live_state: dict, key: str) -> str:
+    """
+    Update live_state["menu"] based on key.
+    Returns an action string: "continue", "quit", "open_editor", "edit_spec",
+    "show_project", "select_language", "generate_main", "rebuild", "compile", "run".
+    """
+    menu = live_state["menu"]
+    has_context = live_state.get("context") is not None
+
+    if menu == "main":
+        if key in ("s", "S"):
+            live_state["menu"] = "specs"
+        elif key in ("c", "C") and has_context:
+            live_state["menu"] = "code"
+        elif key in ("p", "P") and has_context:
+            live_state["menu"] = "project"
+        elif key in ("q", "Q", "ESC", "\x03", "\x04"):
+            return "quit"
+
+    elif menu == "specs":
+        if key in ("e", "E"):
+            return "open_editor"
+        elif key in ("m", "M") and has_context:
+            entries = [
+                e for e in live_state["context"].get("functions", [])
+                if e.get("kind") != "demo"
+            ]
+            live_state["spec_entries"] = entries
+            live_state["spec_idx"] = 0
+            live_state["menu"] = "select_spec"
+        elif key in ("ESC", "\x03"):
+            live_state["menu"] = "main"
+
+    elif menu == "code":
+        if key in ("g", "G"):
+            return "generate_main"
+        elif key in ("r", "R"):
+            return "rebuild"
+        elif key in ("k", "K"):
+            return "compile"
+        elif key in ("x", "X"):
+            return "run"
+        elif key in ("ESC", "\x03"):
+            live_state["menu"] = "main"
+
+    elif menu == "project":
+        if key in ("v", "V"):
+            return "show_project"
+        elif key in ("l", "L"):
+            return "select_language"
+        elif key in ("ESC", "\x03"):
+            live_state["menu"] = "main"
+
+    elif menu == "select_spec":
+        entries = live_state.get("spec_entries", [])
+        n = len(entries)
+        if key == "\x1b[A" and n:
+            live_state["spec_idx"] = (live_state["spec_idx"] - 1) % n
+        elif key == "\x1b[B" and n:
+            live_state["spec_idx"] = (live_state["spec_idx"] + 1) % n
+        elif key in ("\r", "\n") and entries:
+            return "edit_spec"
+        elif key in ("ESC", "\x03"):
+            live_state["menu"] = "specs"
+
+    return "continue"
+
+
+# ---------------------------------------------------------------------------
+# Action handlers (called with outer Live stopped, except generate/rebuild)
+# ---------------------------------------------------------------------------
+
+def _action_edit(live_state: dict, project_dir: Path, stacked: bool) -> None:
+    """Open editor for a new spec, validate, and generate."""
+    tmp_spec = Path("/tmp/speccode_input.lean")
+    if not live_state.get("has_validation_errors"):
+        tmp_spec.write_text("", encoding="utf-8")
+
+    raw = run_once()
+    if raw is None:
+        live_state["has_validation_errors"] = False
+        live_state["menu"] = "specs"
+        return
+
+    content = _strip_error_header(raw)
+    if not content.strip():
+        live_state["has_validation_errors"] = False
+        live_state["menu"] = "specs"
+        return
+
+    ds = DisplayState()
+    result = validate_and_generate(content, ds, stacked, CURRENT_LANGUAGE)
+
+    if result == "invalid":
+        live_state["has_validation_errors"] = True
+        with ds._lock:
+            errors = list(ds.validation_errors)
+        _inject_errors_into_file(tmp_spec, content, errors)
+    else:
+        live_state["has_validation_errors"] = False
+        live_state["context"] = load_context(project_dir)
+
+    live_state["menu"] = "specs"
+
+
+def _action_edit_spec(live_state: dict, project_dir: Path) -> None:
+    """Open editor on the selected spec, update hash if changed."""
+    entries = live_state.get("spec_entries", [])
+    idx = live_state.get("spec_idx", 0)
+    if not entries or idx >= len(entries):
+        live_state["menu"] = "specs"
+        return
+
+    entry = entries[idx]
+    fn_name = entry.get("name", "")
+    spec_file_path = project_dir / entry.get("spec_file", f"specs/{fn_name}.lean")
+
+    editor = os.environ.get("EDITOR", "nano")
+    try:
+        subprocess.run([editor, str(spec_file_path)])
+    except FileNotFoundError:
+        console.print(f"  [red]Editor not found: {editor}[/red]")
+        live_state["menu"] = "specs"
+        return
+
+    if not spec_file_path.exists():
+        live_state["menu"] = "specs"
+        return
+
+    new_content = spec_file_path.read_text(encoding="utf-8")
+    new_hash = hashlib.sha256(new_content.encode()).hexdigest()[:8]
+    old_hash = entry.get("spec_hash", "")
+
+    if new_hash != old_hash:
+        ctx2 = load_context(project_dir)
+        if ctx2:
+            for fn in ctx2.get("functions", []):
+                if fn.get("name") == fn_name:
+                    fn["spec_hash"] = new_hash
+                    fn["stale"] = True
+                    break
+            save_context(project_dir, ctx2)
+        live_state["context"] = load_context(project_dir)
+        console.print("  [yellow]spec updated — run [r] to rebuild[/yellow]")
+
+    live_state["menu"] = "specs"
+
+
+def _action_show_project(live_state: dict, project_dir: Path) -> None:
+    """Display project summary, wait for keypress."""
+    context = live_state.get("context")
+    if not context:
+        live_state["menu"] = "main"
+        return
+
+    lines = [f"  [bold]Project:[/bold] {context.get('project', project_dir.name)}"]
+    lines.append(f"  Language: {context.get('language', '?')}")
+    lines.append("")
+    all_entries = context.get("functions", [])
+    type_entries = [e for e in all_entries if e.get("kind") == "type"]
+    fn_entries = [e for e in all_entries if e.get("kind", "function") == "function"]
+    if type_entries:
+        lines.append(f"  [dim]Types ({len(type_entries)})[/dim]")
+        for fn in type_entries:
+            lines.append(
+                f"  [rgb(100,140,180)]{fn['name']}[/rgb(100,140,180)]"
+                f"         {fn.get('spec_file', '?')}"
             )
-            console.print(stats)
-        else:
-            console.print()
-            no_proj = Text("  ")
-            no_proj.append("◆ ", style="bold rgb(100,140,180)")
-            no_proj.append("new project", style="dim")
-            console.print(no_proj)
+        lines.append("")
+    if fn_entries:
+        lines.append(f"  [dim]Functions ({len(fn_entries)})[/dim]")
+    for fn in fn_entries:
+        thms = ", ".join(fn.get("theorems", [])) or "—"
+        lines.append(f"  [rgb(100,140,180)]{fn['name']}[/rgb(100,140,180)]")
+        lines.append(f"    spec: {fn.get('spec_file', '?')}")
+        lines.append(f"    theorems: {thms}")
+        lines.append(f"    generated: {fn.get('generated_at', '?')}")
+    specs_md_path = project_dir / "SPECS.md"
+    lines.append("")
+    if specs_md_path.exists():
+        lines.append("  [green]SPECS.md up to date[/green]")
+    else:
+        lines.append("  [yellow]SPECS.md missing — regenerate with [r][/yellow]")
 
-        # Main menu
-        main_items = [("s", "specs")]
-        if has_context:
-            main_items += [("c", "code"), ("p", "project")]
-        main_items += [("q", "quit")]
+    console.print(Panel(
+        "\n".join(lines),
+        title="[bold]Project Summary[/bold]",
+        border_style="rgb(100,140,180)",
+    ))
+    console.print("  [dim]Press any key to continue...[/dim]")
+    _read_key_safe()
+    live_state["menu"] = "main"
 
-        menu_text = Text("  ")
-        for i, (k, label) in enumerate(main_items):
-            if i > 0:
-                menu_text.append("   ", style="dim")
-            menu_text.append(f"[{k}]", style="rgb(100,140,180)")
-            menu_text.append(f" {label}", style="dim")
 
-        console.print()
-        console.print(menu_text)
-        console.print()
+def _action_generate_main(live_state: dict, live: Live, project_dir: Path, stacked: bool) -> None:
+    """Stream generate_main into the outer Live display."""
+    context = live_state.get("context")
+    if not context:
+        live_state["menu"] = "main"
+        return
 
-        # Key loop for main menu
-        while True:
-            console.print("  [rgb(100,140,180)]>[/rgb(100,140,180)] ", end="")
-            try:
-                key = _read_key()
-            except (EOFError, KeyboardInterrupt):
-                console.print()
-                return "quit"
-            console.print()
+    lang = context.get("language", CURRENT_LANGUAGE)
+    cfg_obj = LANGUAGE_CONFIGS.get(lang, LANGUAGE_CONFIGS["c++"])
 
-            if key in ("s", "S"):
-                result = _menu_specs(has_context)
-                if result is not None:
-                    return result
-                break  # back → redraw main menu
+    ds = DisplayState()
+    with ds._lock:
+        ds.validation_state = "valid"
+        ds.lang_fence = LANG_FENCE.get(lang, "cpp")
+        ds.fn_name = "main"
+    ds.handle_event("generating", {})
+    live.update(_Renderable(ds, stacked))
 
-            if key in ("c", "C") and has_context:
-                result = _menu_code()
-                if result is not None:
-                    return result
-                break
+    done = threading.Event()
 
-            if key in ("p", "P") and has_context:
-                result = _menu_project()
-                if result is not None:
-                    return result
-                break
+    def _run():
+        try:
+            def on_chunk(chunk: str):
+                ds.handle_event("streaming", {"chunk": chunk})
+            code = generate_main(context, project_dir, target_language=lang, on_chunk=on_chunk)
+            ds.handle_event("done", {
+                "code": code,
+                "fn_name": "main",
+                "src_file": str(project_dir / f"src/main{cfg_obj['ext']}"),
+                "spec_file": "",
+                "cost": {"cost_total": 0.0, "codestral_tokens": 0},
+                "lang_fence": LANG_FENCE.get(lang, "cpp"),
+                "lang_ext": cfg_obj["ext"],
+                "output_dir": str(project_dir),
+            })
+        except Exception as e:
+            ds.handle_event("error", {"message": str(e)})
+        done.set()
 
-            if key in ("q", "Q", "\x03", "\x04"):
-                return "quit"
-            # unknown key: re-show prompt
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    done.wait()
+    live.update(build_renderable(ds, stacked))
+    t.join()
+    time.sleep(1.5)
+    live_state["context"] = load_context(project_dir)
+    live_state["menu"] = "main"
+
+
+def _action_rebuild(live_state: dict, live: Live, project_dir: Path, stacked: bool) -> None:
+    """Rebuild all specs, streaming each into the outer Live display."""
+    context = live_state.get("context")
+    if not context:
+        live_state["menu"] = "main"
+        return
+
+    lang = CURRENT_LANGUAGE
+    functions = [f for f in context.get("functions", []) if f.get("kind") != "demo"]
+
+    for fn in functions:
+        fn_name = fn["name"]
+        spec_path = project_dir / fn.get("spec_file", f"specs/{fn_name}.lean")
+        if not spec_path.exists():
+            continue
+        spec_content = spec_path.read_text(encoding="utf-8")
+
+        ds = DisplayState()
+        with ds._lock:
+            ds.validation_state = "valid"
+            ds.spec_lines = spec_content.splitlines()
+            ds.lang_fence = LANG_FENCE.get(lang, "cpp")
+            ds.fn_name = fn_name
+        ds.handle_event("generating", {})
+        live.update(_Renderable(ds, stacked))
+
+        done = threading.Event()
+
+        def _run(_spec=spec_content, _ds=ds, _done=done):
+            run_pipeline(_spec, on_event=_ds.handle_event,
+                         target_language=lang, project_dir=project_dir)
+            _done.set()
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        done.wait()
+        live.update(build_renderable(ds, stacked))
+        t.join()
+        time.sleep(0.5)
+
+    live_state["context"] = load_context(project_dir)
+    live_state["menu"] = "main"
 
 
 def _prompt_language() -> str:
@@ -736,37 +933,6 @@ def run_once() -> str | None:
 
     return tmp.read_text(encoding="utf-8") if tmp.exists() else ""
 
-
-def generate(spec: str, state: DisplayState, stacked: bool, language: str = "c++") -> None:
-    """Generation phase: streaming output with live display."""
-    with state._lock:
-        state.spec_lines = spec.splitlines()
-        state.lang_fence = LANG_FENCE.get(language, "cpp")
-
-    pipeline_done = threading.Event()
-
-    def pipeline_thread():
-        run_pipeline(
-            spec,
-            on_event=state.handle_event,
-            target_language=language,
-            project_dir=Path.cwd(),
-        )
-        pipeline_done.set()
-
-    t = threading.Thread(target=pipeline_thread, daemon=True)
-    t.start()
-
-    with Live(
-        _Renderable(state, stacked),
-        console=console,
-        refresh_per_second=15,
-        transient=False,
-    ) as live:
-        pipeline_done.wait()
-        live.update(build_renderable(state, stacked))  # final frame
-
-    t.join()
 
 
 def validate_and_generate(content: str, state: DisplayState, stacked: bool, language: str) -> str:
@@ -840,7 +1006,6 @@ def validate_and_generate(content: str, state: DisplayState, stacked: bool, lang
 def main():
     global CURRENT_LANGUAGE
 
-    # Check prerequisites before anything
     err = check_prerequisites()
     if err:
         console.print(Panel(
@@ -850,244 +1015,72 @@ def main():
         ))
         sys.exit(1)
 
-    # Determine layout
     _, rows = shutil.get_terminal_size()
     stacked = rows > 40
 
     _print_intro()
 
-    # Load project context
     project_dir = Path.cwd()
     context = load_context(project_dir)
+    if context:
+        CURRENT_LANGUAGE = context.get("language", CURRENT_LANGUAGE)
 
-    next_action: str | None = None
-    has_validation_errors = False
+    live_state: dict = {
+        "menu": "main",
+        "context": context,
+        "project_dir": project_dir,
+        "spec_idx": 0,
+        "spec_entries": [],
+        "has_validation_errors": False,
+        "stacked": stacked,
+    }
 
     try:
-        while True:
-            if next_action is None:
-                action = render_menu(project_dir)
-            else:
-                action, next_action = next_action, None
+        with Live(
+            _render_menu_state(live_state),
+            console=console,
+            refresh_per_second=10,
+            transient=False,
+        ) as live:
+            while True:
+                live.update(_render_menu_state(live_state))
+                key = _read_key_safe()
+                action = _transition(live_state, key)
 
-            if action == "quit":
-                break
+                if action == "quit":
+                    break
 
-            if action in ("compile", "run"):
-                continue  # not yet implemented
+                elif action == "open_editor":
+                    live.stop()
+                    _action_edit(live_state, project_dir, stacked)
+                    live.start()
 
-            if action == "language":
-                CURRENT_LANGUAGE = _prompt_language()
-                continue
+                elif action == "edit_spec":
+                    live.stop()
+                    _action_edit_spec(live_state, project_dir)
+                    live.start()
 
-            if action == "project":
-                context = load_context(project_dir)
-                if context:
-                    lines = [f"  [bold]Project:[/bold] {context.get('project', project_dir.name)}"]
-                    lines.append(f"  Language: {context.get('language', '?')}")
-                    lines.append("")
-                    all_entries = context.get("functions", [])
-                    type_entries = [e for e in all_entries if e.get("kind") == "type"]
-                    fn_entries = [e for e in all_entries if e.get("kind", "function") == "function"]
-                    if type_entries:
-                        lines.append(f"  [dim]Types ({len(type_entries)})[/dim]")
-                        for fn in type_entries:
-                            lines.append(
-                                f"  [rgb(100,140,180)]{fn['name']}[/rgb(100,140,180)]"
-                                f"         {fn.get('spec_file', '?')}"
-                            )
-                        lines.append("")
-                    if fn_entries:
-                        lines.append(f"  [dim]Functions ({len(fn_entries)})[/dim]")
-                    for fn in fn_entries:
-                        thms = ", ".join(fn.get("theorems", [])) or "—"
-                        lines.append(f"  [rgb(100,140,180)]{fn['name']}[/rgb(100,140,180)]")
-                        lines.append(f"    spec: {fn.get('spec_file', '?')}")
-                        lines.append(f"    theorems: {thms}")
-                        lines.append(f"    generated: {fn.get('generated_at', '?')}")
-                    specs_md_path = project_dir / "SPECS.md"
-                    if specs_md_path.exists():
-                        lines.append("")
-                        lines.append("  [green]SPECS.md up to date[/green]")
-                    else:
-                        lines.append("")
-                        lines.append("  [yellow]SPECS.md missing — regenerate with [r][/yellow]")
-                    from rich.panel import Panel as _Panel
-                    console.print(_Panel(
-                        "\n".join(lines),
-                        title="[bold]Project Summary[/bold]",
-                        border_style="rgb(100,140,180)",
-                    ))
-                continue
+                elif action == "show_project":
+                    live.stop()
+                    _action_show_project(live_state, project_dir)
+                    live.start()
 
-            if action == "rebuild":
-                context = load_context(project_dir)
-                if not context:
-                    console.print("  [yellow]No context found.[/yellow]")
-                    continue
-                functions = context.get("functions", [])
-                console.print(f"  [rgb(100,140,180)]Rebuilding {len(functions)} function(s)...[/rgb(100,140,180)]")
-                for fn in functions:
-                    fn_name = fn["name"]
-                    spec_path = project_dir / fn.get("spec_file", f"specs/{fn_name}.lean")
-                    if not spec_path.exists():
-                        console.print(f"  [yellow]skip {fn_name}: spec not found[/yellow]")
-                        continue
-                    console.print(f"  [dim]→ {fn_name}[/dim]")
-                    spec_content = spec_path.read_text(encoding="utf-8")
-                    state = DisplayState()
-                    validate_and_generate(spec_content, state, stacked, CURRENT_LANGUAGE)
-                context = load_context(project_dir)
-                emit_ctx = {"fn_count": len(context.get("functions", [])) if context else 0}
-                console.print(f"  [green]✓ rebuild done — {emit_ctx['fn_count']} function(s)[/green]")
-                continue
-
-            if action == "modify":
-                context = load_context(project_dir)
-                if not context:
-                    continue
-                fn_name = select_spec(context)
-                if fn_name is None:
-                    continue
-                entry = next((e for e in context.get("functions", []) if e.get("name") == fn_name), None)
-                spec_file_path = project_dir / (entry.get("spec_file", f"specs/{fn_name}.lean") if entry else f"specs/{fn_name}.lean")
-                editor = os.environ.get("EDITOR", "nano")
-                console.print(f"  [dim]Opening {spec_file_path.name}...[/dim]")
-                try:
-                    subprocess.run([editor, str(spec_file_path)])
-                except FileNotFoundError:
-                    console.print(f"  [red]Editor not found: {editor}[/red]")
-                    continue
-                if not spec_file_path.exists():
-                    continue
-                new_content = spec_file_path.read_text(encoding="utf-8")
-                new_hash = hashlib.sha256(new_content.encode()).hexdigest()[:8]
-                old_hash = entry.get("spec_hash", "") if entry else ""
-                if new_hash != old_hash:
-                    ctx2 = load_context(project_dir)
-                    if ctx2:
-                        for fn in ctx2.get("functions", []):
-                            if fn.get("name") == fn_name:
-                                fn["spec_hash"] = new_hash
-                                fn["stale"] = True
-                                break
-                        save_context(project_dir, ctx2)
-                    console.print("  [yellow]spec updated — run [r] to rebuild[/yellow]")
-                context = load_context(project_dir)
-                continue
-
-            if action == "generate_main":
-                context = load_context(project_dir)
-                if not context:
-                    continue
-                lang = context.get("language", CURRENT_LANGUAGE)
-                cfg_obj = LANGUAGE_CONFIGS.get(lang, LANGUAGE_CONFIGS["c++"])
-
-                state = DisplayState()
-                with state._lock:
-                    state.validation_state = "valid"
-                    state.lang_fence = LANG_FENCE.get(lang, "cpp")
-                    state.fn_name = "main"
-                state.handle_event("generating", {})
-
-                gen_done = threading.Event()
-                gen_error: list[str] = []
-
-                def _gen(_ctx=context, _lang=lang, _cfg=cfg_obj, _state=state, _done=gen_done, _err=gen_error):
-                    try:
-                        def _on_chunk(chunk: str):
-                            _state.handle_event("streaming", {"chunk": chunk})
-                        code = generate_main(
-                            _ctx,
-                            project_dir,
-                            target_language=_lang,
-                            on_chunk=_on_chunk,
-                        )
-                        _state.handle_event("done", {
-                            "code": code,
-                            "fn_name": "main",
-                            "src_file": str(project_dir / f"src/main{_cfg['ext']}"),
-                            "spec_file": "",
-                            "cost": {"cost_total": 0.0, "codestral_tokens": 0},
-                            "lang_fence": LANG_FENCE.get(_lang, "cpp"),
-                            "lang_ext": _cfg["ext"],
-                            "output_dir": str(project_dir),
-                        })
-                    except Exception as e:
-                        _err.append(str(e))
-                        _state.handle_event("error", {"message": str(e)})
-                    _done.set()
-
-                t = threading.Thread(target=_gen, daemon=True)
-                t.start()
-
-                with Live(
-                    _Renderable(state, stacked),
-                    console=console,
-                    refresh_per_second=15,
-                    transient=False,
-                ) as live:
-                    gen_done.wait()
-                    live.update(build_renderable(state, stacked))
-
-                t.join()
-
-                if not gen_error:
-                    console.print(f"  [green]✓ saved to src/main{cfg_obj['ext']}[/green]")
-
-                context = load_context(project_dir)
-                continue
-
-            # action == "edit"
-            tmp_spec = Path("/tmp/speccode_input.lean")
-
-            # A. Prepare the temp file: empty for new specs,
-            #    or keep as-is (errors already injected) for validation retries.
-            if not has_validation_errors:
-                tmp_spec.write_text("", encoding="utf-8")
-
-            # Open editor, read raw content
-            raw = run_once()
-            if raw is None:
-                has_validation_errors = False
-                continue  # editor not found — back to menu
-
-            # B. Strip header comments; if nothing remains, back to menu
-            content = _strip_error_header(raw)
-            if not content.strip():
-                has_validation_errors = False
-                console.print("[yellow]No input.[/yellow]")
-                continue
-
-            # C/D. Show spec with "validating..." then validate and optionally generate
-            state = DisplayState()
-            result = validate_and_generate(content, state, stacked, CURRENT_LANGUAGE)
-
-            # E. Invalid — show full menu; inject errors if user chooses to edit
-            if result == "invalid":
-                has_validation_errors = True
-                with state._lock:
-                    errors = list(state.validation_errors)
-
-                action = render_menu(project_dir)
-                if action == "edit":
-                    _inject_errors_into_file(tmp_spec, content, errors)
-                    next_action = "edit"
-                elif action == "language":
+                elif action == "select_language":
+                    live.stop()
                     CURRENT_LANGUAGE = _prompt_language()
-                    _inject_errors_into_file(tmp_spec, content, errors)
-                    next_action = "edit"
-                elif action == "quit":
-                    has_validation_errors = False
-                    next_action = "quit"
-                else:
-                    next_action = action  # project or rebuild — pass through
-                continue
+                    live.start()
+                    live_state["menu"] = "main"
 
-            # F. Valid — pipeline ran (done or error); show full menu
-            has_validation_errors = False
-            context = load_context(project_dir)
-            next_action = render_menu(project_dir)
+                elif action == "generate_main":
+                    _action_generate_main(live_state, live, project_dir, stacked)
+
+                elif action == "rebuild":
+                    _action_rebuild(live_state, live, project_dir, stacked)
+
+                elif action in ("compile", "run"):
+                    pass  # not yet implemented
+
+                # "continue" — live.update at top of loop
 
     except KeyboardInterrupt:
         pass

@@ -521,8 +521,6 @@ def render_menu(project_dir: Path) -> str:
     console.print()
     console.print(menu_text)
     console.print()
-    console.print("  [dim]press a key[/dim]")
-    console.print()
 
     while True:
         try:
@@ -628,19 +626,50 @@ def _action_modify_spec(context: dict, project_dir: Path) -> None:
 
     idx = 0
 
-    with Live(_build_spec_list(entries, idx), console=console, refresh_per_second=10) as live:
-        while True:
-            live.update(_build_spec_list(entries, idx))
-            key = _read_key_safe()
-            if key in ("\x1b[A", "k"):
-                idx = (idx - 1) % len(entries)
-            elif key in ("\x1b[B", "j"):
-                idx = (idx + 1) % len(entries)
-            elif key == "\r":
-                break
-            elif key in ("q", "Q", "ESC", "\x03"):
-                idx = -1
-                break
+    def render(i: int) -> list[str]:
+        lines = [""]
+        lines.append("  select spec to modify")
+        lines.append("")
+        for j, entry in enumerate(entries):
+            name = entry.get("name", "?")
+            spec_file = entry.get("spec_file", f"specs/{name}.lean")
+            if j == i:
+                lines.append(f"  \x1b[97;1m→ {name:<20}  {spec_file}\x1b[0m")
+            else:
+                lines.append(f"  \x1b[2m  {name:<20}  {spec_file}\x1b[0m")
+        lines.append("")
+        lines.append("  \x1b[2m↑↓   Enter select   q cancel\x1b[0m")
+        lines.append("")
+        return lines
+
+    lines = render(idx)
+    for line in lines:
+        sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+    n_lines = len(lines)
+
+    while True:
+        key = _read_key_safe()
+        if key in ("\x1b[A", "k"):
+            idx = (idx - 1) % len(entries)
+        elif key in ("\x1b[B", "j"):
+            idx = (idx + 1) % len(entries)
+        elif key == "\r":
+            break
+        elif key in ("q", "Q", "ESC", "\x03"):
+            idx = -1
+            break
+        else:
+            continue
+
+        sys.stdout.write(f"\x1b[{n_lines}A\x1b[0J")
+        lines = render(idx)
+        for line in lines:
+            sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
+    sys.stdout.write(f"\x1b[{n_lines}A\x1b[0J")
+    sys.stdout.flush()
 
     if idx == -1:
         return
@@ -657,20 +686,17 @@ def _action_modify_spec(context: dict, project_dir: Path) -> None:
         console.print(f"  [red]Editor not found: {editor}[/red]")
         return
 
-    if not spec_path.exists():
-        return
-
     new_content = spec_path.read_text(encoding="utf-8")
     new_hash = hashlib.sha256(new_content.encode()).hexdigest()[:8]
 
-    context = load_context(project_dir)
-    if context:
-        for fn in context.get("functions", []):
+    ctx = load_context(project_dir)
+    if ctx:
+        for fn in ctx.get("functions", []):
             if fn["name"] == entries[idx]["name"]:
                 fn["spec_hash"] = new_hash
                 fn["stale"] = True
                 break
-        save_context(project_dir, context)
+        save_context(project_dir, ctx)
 
     console.print("  [green]✓ spec updated — run [r] to rebuild[/green]")
     time.sleep(1.5)

@@ -516,78 +516,59 @@ def _print_intro() -> None:
     console.print()
 
 
-def _menu_line(items: list[tuple[str, str]]) -> None:
-    """Print a sub-menu line from (key, label) pairs."""
-    menu_text = Text("  ")
-    for i, (key, label) in enumerate(items):
-        if i > 0:
-            menu_text.append("   ", style="dim")
-        menu_text.append(f"[{key}]", style="rgb(100,140,180)")
-        menu_text.append(f" {label}", style="dim")
-    console.print()
-    console.print(menu_text)
-    console.print()
-
-
-def _menu_prompt() -> str:
-    """Print the prompt and return one keypress (via readchar)."""
+def _submenu(items: list[tuple[str, str, str]]) -> str | None:
+    """
+    Display a static sub-menu with Rich Live (no scroll, no extra lines).
+    items: list of (key_char, label, action).
+    Returns action string, or None on Esc.
+    """
     import readchar
-    console.print("  [rgb(100,140,180)]>[/rgb(100,140,180)] ", end="")
-    key = readchar.readkey()
-    console.print()
-    return key
+
+    content = Text("\n  ")
+    for i, (key, label, _) in enumerate(items):
+        if i > 0:
+            content.append("   ")
+        content.append(f"[{key}]", style="rgb(100,140,180)")
+        content.append(f" {label}", style="dim")
+    content.append("\n\n  ")
+    content.append("Esc to go back", style="dim")
+    content.append("\n")
+    panel = Panel(content, border_style="dim")
+
+    with Live(panel, console=console, refresh_per_second=10, transient=True):
+        while True:
+            key = readchar.readkey()
+            for k, _, action in items:
+                if key.lower() == k.lower():
+                    return action
+            if key in ("\x1b", "\x03", "\x04"):
+                return None
 
 
 def _menu_specs(has_context: bool) -> str | None:
-    """[s] specs sub-menu. Returns action or None for back."""
-    items = [("e", "new"), ("m", "modify"), ("←", "back")]
-    if not has_context:
-        items = [("e", "new"), ("←", "back")]
-    _menu_line(items)
-    while True:
-        key = _menu_prompt()
-        if key in ("e", "E"):
-            return "edit"
-        if key in ("m", "M") and has_context:
-            return "modify"
-        if key in ("\x1b", "\x03", "\x04") or key in ("\x1b[D",):  # Esc / left arrow
-            return None
-        if key == "q":
-            return None
+    """[s] specs sub-menu."""
+    items = [("e", "new", "edit")]
+    if has_context:
+        items.append(("m", "modify", "modify"))
+    return _submenu(items)
 
 
 def _menu_code() -> str | None:
-    """[c] code sub-menu. Returns action or None for back."""
-    _menu_line([("g", "generate main"), ("r", "rebuild"), ("k", "compile"), ("x", "run"), ("←", "back")])
-    while True:
-        key = _menu_prompt()
-        if key in ("g", "G"):
-            return "generate_main"
-        if key in ("r", "R"):
-            return "rebuild"
-        if key in ("k", "K"):
-            return "compile"
-        if key in ("x", "X"):
-            return "run"
-        if key in ("\x1b", "\x03", "\x04") or key in ("\x1b[D",):
-            return None
-        if key == "q":
-            return None
+    """[c] code sub-menu."""
+    return _submenu([
+        ("g", "generate main", "generate_main"),
+        ("r", "rebuild",       "rebuild"),
+        ("k", "compile",       "compile"),
+        ("x", "run",           "run"),
+    ])
 
 
 def _menu_project() -> str | None:
-    """[p] project sub-menu. Returns action or None for back."""
-    _menu_line([("v", "view summary"), ("l", "language"), ("←", "back")])
-    while True:
-        key = _menu_prompt()
-        if key in ("v", "V"):
-            return "project"
-        if key in ("l", "L"):
-            return "language"
-        if key in ("\x1b", "\x03", "\x04") or key in ("\x1b[D",):
-            return None
-        if key == "q":
-            return None
+    """[p] project sub-menu."""
+    return _submenu([
+        ("v", "view summary", "project"),
+        ("l", "language",     "language"),
+    ])
 
 
 def render_menu(project_dir: Path) -> str:

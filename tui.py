@@ -525,6 +525,7 @@ def _render_menu_state(live_state: dict) -> Panel:
         "specs":       ["specs"],
         "code":        ["code"],
         "project":     ["project"],
+        "language":    ["project", "language"],
         "select_spec": ["specs", "modify"],
     }
 
@@ -566,6 +567,28 @@ def _render_menu_state(live_state: dict) -> Panel:
 
     elif menu == "project":
         _append_menu_items(content, [("v", "view summary"), ("l", "language")])
+        content.append("\n  ")
+        content.append("Esc to go back\n", style="dim")
+
+    elif menu == "language":
+        current = live_state.get("context", {}) or {}
+        current_lang = current.get("language", CURRENT_LANGUAGE)
+        lang_items = [
+            ("1", "c++"), ("2", "python"), ("3", "rust"),
+            ("4", "ocaml"), ("5", "go"), ("6", "typescript"),
+        ]
+        lang_map_rev = {v: k for k, v in [
+            ("1", "c++"), ("2", "python"), ("3", "rust"),
+            ("4", "ocaml"), ("5", "go"), ("6", "typescript"),
+        ]}
+        for key_num, lang_name in lang_items:
+            if lang_name == current_lang:
+                content.append(f"  [{key_num}] ", style="rgb(100,140,180)")
+                content.append(f"{lang_name}", style="bold bright_white")
+                content.append("  ←\n", style="dim")
+            else:
+                content.append(f"  [{key_num}] ", style="rgb(100,140,180)")
+                content.append(f"{lang_name}\n", style="dim")
         content.append("\n  ")
         content.append("Esc to go back\n", style="dim")
 
@@ -621,6 +644,7 @@ def _transition(live_state: dict, key: str) -> str:
             live_state["menu"] = "select_spec"
         elif key in ("ESC", "\x03"):
             live_state["menu"] = "main"
+            live_state["needs_clear"] = True
 
     elif menu == "code":
         if key in ("g", "G"):
@@ -633,14 +657,28 @@ def _transition(live_state: dict, key: str) -> str:
             return "run"
         elif key in ("ESC", "\x03"):
             live_state["menu"] = "main"
+            live_state["needs_clear"] = True
 
     elif menu == "project":
         if key in ("v", "V"):
             return "show_project"
         elif key in ("l", "L"):
-            return "select_language"
+            live_state["menu"] = "language"
         elif key in ("ESC", "\x03"):
             live_state["menu"] = "main"
+            live_state["needs_clear"] = True
+
+    elif menu == "language":
+        lang_map = {
+            "1": "c++", "2": "python", "3": "rust",
+            "4": "ocaml", "5": "go", "6": "typescript",
+        }
+        if key in lang_map:
+            live_state["selected_language"] = lang_map[key]
+            live_state["menu"] = "main"
+            live_state["needs_clear"] = True
+        elif key in ("ESC", "\x03"):
+            live_state["menu"] = "project"
 
     elif menu == "select_spec":
         entries = live_state.get("spec_entries", [])
@@ -1043,6 +1081,10 @@ def main():
             transient=False,
         ) as live:
             while True:
+                if live_state.pop("needs_clear", False):
+                    console.clear()
+                if "selected_language" in live_state:
+                    CURRENT_LANGUAGE = live_state.pop("selected_language")
                 live.update(_render_menu_state(live_state))
                 key = _read_key_safe()
                 action = _transition(live_state, key)
@@ -1053,23 +1095,20 @@ def main():
                 elif action == "open_editor":
                     live.stop()
                     _action_edit(live_state, project_dir, stacked)
+                    console.clear()
                     live.start()
 
                 elif action == "edit_spec":
                     live.stop()
                     _action_edit_spec(live_state, project_dir)
+                    console.clear()
                     live.start()
 
                 elif action == "show_project":
                     live.stop()
                     _action_show_project(live_state, project_dir)
+                    console.clear()
                     live.start()
-
-                elif action == "select_language":
-                    live.stop()
-                    CURRENT_LANGUAGE = _prompt_language()
-                    live.start()
-                    live_state["menu"] = "main"
 
                 elif action == "generate_main":
                     _action_generate_main(live_state, live, project_dir, stacked)

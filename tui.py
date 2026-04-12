@@ -613,22 +613,29 @@ def _prompt_language() -> str:
 # ---------------------------------------------------------------------------
 
 def _read_key_safe() -> str:
-    """Read one keypress; returns full ANSI sequence for arrows, raw char otherwise."""
+    """Read one keypress using buffer; returns arrow sequences or decoded char."""
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
-        ch = sys.stdin.read(1)
-        if ch == "\x1b":
-            r, _, _ = select.select([sys.stdin], [], [], 0.05)
-            if r:
-                ch2 = sys.stdin.read(1)
-                if ch2 == "[":
-                    ch3 = sys.stdin.read(1)
-                    return "\x1b[" + ch3
-                return ch  # ignore other esc sequences
-            return ch  # bare esc: ignore
-        return ch
+        ch = sys.stdin.buffer.read(1)
+        if ch == b"\x1b":
+            seq = b"\x1b"
+            for _ in range(4):
+                r, _, _ = select.select([sys.stdin], [], [], 0.02)
+                if not r:
+                    break
+                seq += sys.stdin.buffer.read(1)
+            if seq == b"\x1b[A":
+                return "\x1b[A"
+            if seq == b"\x1b[B":
+                return "\x1b[B"
+            if seq == b"\x1b[C":
+                return "\x1b[C"
+            if seq == b"\x1b[D":
+                return "\x1b[D"
+            return "IGNORED"
+        return ch.decode("utf-8", errors="replace")
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 

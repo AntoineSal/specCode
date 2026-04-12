@@ -469,21 +469,28 @@ def _print_intro() -> None:
 
 def _read_key_safe() -> str:
     """
-    Read one key from stdin using readchar, with proper Esc detection on Mac.
+    Read one key from stdin using raw termios, with proper Esc detection on Mac.
     - Bare Esc (no follow-up chars within 50ms) → returns 'ESC'
     - Arrow sequences → returns '\x1b[A', '\x1b[B', '\x1b[C', '\x1b[D'
     - Any other char → returns it as-is
     """
-    import readchar as _rc
-    ch = _rc.readchar()
-    if ch == "\x1b":
-        if select.select([sys.stdin], [], [], 0.05)[0]:
-            ch2 = _rc.readchar()
-            if ch2 == "[":
-                ch3 = _rc.readchar()
-                return f"\x1b[{ch3}"
-        return "ESC"
-    return ch
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            r, _, _ = select.select([sys.stdin], [], [], 0.05)
+            if r:
+                ch2 = sys.stdin.read(1)
+                if ch2 == "[":
+                    ch3 = sys.stdin.read(1)
+                    return "\x1b[" + ch3  # arrow key
+                return "\x1b" + ch2
+            return "ESC"  # bare Esc, no follow-up
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 # ---------------------------------------------------------------------------
@@ -491,14 +498,13 @@ def _read_key_safe() -> str:
 # ---------------------------------------------------------------------------
 
 _B = "\x1b[38;2;100;140;180m"   # blue
-_W = "\x1b[97m"                  # bright white
+_W = "\x1b[97;1m"                # bright white + bold
 _D = "\x1b[2m"                   # dim
-_X = "\x1b[1m"                   # bold
 _R = "\x1b[0m"                   # reset
 
 
 def _kw(key: str, label: str) -> str:
-    return f"{_B}[{key}]{_R}{_D} {label}{_R}"
+    return f"{_B}[{key}]{_R} {label}"
 
 
 def clear_lines(n: int) -> None:
@@ -533,7 +539,7 @@ def print_menu(state: dict) -> int:
         "language":    ["project", "language"],
         "select_spec": ["specs", "modify"],
     }
-    title = f"  {_B}{_X}◆{_R} {_X}{_W}{project_name}{_R}"
+    title = f"  {_B}◆{_R} {_W}{project_name}{_R}"
     for crumb in crumb_map.get(menu, []):
         title += f"  {_D}›  {crumb}{_R}"
 
@@ -543,25 +549,25 @@ def print_menu(state: dict) -> int:
             items += [_kw("c", "code"), _kw("p", "project")]
         items.append(_kw("q", "quit"))
         opts = "  " + "   ".join(items)
-        text = f"\n{title}\n{stats}\n\n{opts}\n\n  {_D}>{_R}\n"
+        text = f"\n{title}\n{stats}\n\n{opts}\n\n  >"
 
     elif menu == "specs":
         items = [_kw("e", "new")]
         if has_context:
             items.append(_kw("m", "modify"))
         opts = "  " + "   ".join(items)
-        text = f"\n{title}\n\n{opts}\n\n  {_D}Esc to go back{_R}\n\n  {_D}>{_R}\n"
+        text = f"\n{title}\n\n{opts}\n\n  {_D}Esc to go back{_R}\n\n  >"
 
     elif menu == "code":
         opts = "  " + "   ".join([
             _kw("g", "generate main"), _kw("r", "rebuild"),
             _kw("k", "compile"), _kw("x", "run"),
         ])
-        text = f"\n{title}\n\n{opts}\n\n  {_D}Esc to go back{_R}\n\n  {_D}>{_R}\n"
+        text = f"\n{title}\n\n{opts}\n\n  {_D}Esc to go back{_R}\n\n  >"
 
     elif menu == "project":
         opts = "  " + "   ".join([_kw("v", "view summary"), _kw("l", "language")])
-        text = f"\n{title}\n\n{opts}\n\n  {_D}Esc to go back{_R}\n\n  {_D}>{_R}\n"
+        text = f"\n{title}\n\n{opts}\n\n  {_D}Esc to go back{_R}\n\n  >"
 
     elif menu == "language":
         current_lang = (context or {}).get("language", CURRENT_LANGUAGE)
@@ -572,9 +578,9 @@ def print_menu(state: dict) -> int:
         rows = []
         for key_num, lang_name in lang_items:
             if lang_name == current_lang:
-                rows.append(f"  {_B}[{key_num}]{_R} {_X}{_W}{lang_name}{_R}  {_D}←{_R}")
+                rows.append(f"  {_B}[{key_num}]{_R} {_W}{lang_name}{_R}  {_D}←{_R}")
             else:
-                rows.append(f"  {_B}[{key_num}]{_R} {_D}{lang_name}{_R}")
+                rows.append(f"  {_B}[{key_num}]{_R} {lang_name}")
         text = f"\n{title}\n\n" + "\n".join(rows) + f"\n\n  {_D}Esc to go back{_R}\n"
 
     elif menu == "select_spec":
@@ -585,9 +591,9 @@ def print_menu(state: dict) -> int:
             name = entry.get("name", "?")
             spec_file = entry.get("spec_file", f"specs/{name}.lean")
             if i == idx:
-                rows.append(f"  {_B}{_X}→{_R} {_W}{name:<20}{_R}  {_D}{spec_file}{_R}")
+                rows.append(f"  {_B}→{_R} {_W}{name:<20}{_R}  {_D}{spec_file}{_R}")
             else:
-                rows.append(f"    {_D}{name:<20}  {spec_file}{_R}")
+                rows.append(f"    {name:<20}  {_D}{spec_file}{_R}")
         text = (
             f"\n{title}\n\n"
             + "\n".join(rows)

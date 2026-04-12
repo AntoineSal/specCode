@@ -22,7 +22,6 @@ from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
-from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.text import Text
 
@@ -488,25 +487,27 @@ def _read_key_safe() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Menu state machine
+# Menu — ANSI line clearing + plain print approach
 # ---------------------------------------------------------------------------
 
-def _append_menu_items(content: Text, items: list[tuple[str, str]]) -> None:
-    content.append("  ")
-    for i, (key, label) in enumerate(items):
-        if i > 0:
-            content.append("   ")
-        content.append(f"[{key}]", style="rgb(100,140,180)")
-        content.append(f" {label}", style="dim")
-    content.append("\n")
+def clear_lines(n: int) -> None:
+    """Erase the last n lines printed to the terminal."""
+    for _ in range(n):
+        sys.stdout.write("\x1b[1A")  # move up one line
+        sys.stdout.write("\x1b[2K")  # erase that line
+    sys.stdout.flush()
 
 
-def _render_menu_state(live_state: dict) -> Panel:
-    """Build a Rich Panel for the current menu state."""
-    menu = live_state["menu"]
-    context = live_state.get("context")
+def _kw(key: str, label: str) -> str:
+    return f"[rgb(100,140,180)][{key}][/rgb(100,140,180)] [dim]{label}[/dim]"
+
+
+def print_menu(state: dict) -> int:
+    """Print the current menu state. Returns the number of lines printed."""
+    menu = state["menu"]
+    context = state.get("context")
     has_context = context is not None
-    project_dir: Path = live_state["project_dir"]
+    project_dir: Path = state["project_dir"]
 
     if has_context:
         project_name = context.get("project", project_dir.name)
@@ -515,119 +516,142 @@ def _render_menu_state(live_state: dict) -> Panel:
         n_types = sum(1 for e in all_entries if e.get("kind") == "type")
         n_fns = n_total - n_types
         language = context.get("language", CURRENT_LANGUAGE)
-        stats_str = f"{n_total} specs  ·  {n_types} types  ·  {n_fns} functions  ·  {language}"
+        stats_str = f"[dim]{n_total} specs  ·  {n_types} types  ·  {n_fns} fns  ·  {language}[/dim]"
     else:
         project_name = "new project"
         stats_str = ""
 
-    breadcrumbs: dict[str, list[str]] = {
-        "main":        [],
+    crumb_map: dict[str, list[str]] = {
         "specs":       ["specs"],
         "code":        ["code"],
         "project":     ["project"],
         "language":    ["project", "language"],
         "select_spec": ["specs", "modify"],
     }
+    title = (
+        f"  [bold rgb(100,140,180)]◆[/bold rgb(100,140,180)]"
+        f" [bold bright_white]{project_name}[/bold bright_white]"
+    )
+    for crumb in crumb_map.get(menu, []):
+        title += f"  [dim]›  {crumb}[/dim]"
 
-    content = Text()
-    content.append("\n  ")
-    content.append("◆ ", style="bold rgb(100,140,180)")
-    content.append(project_name, style="bold bright_white")
-    for crumb in breadcrumbs.get(menu, []):
-        content.append("  ›  ", style="dim")
-        content.append(crumb, style="dim")
-    content.append("\n")
+    n = 0
 
-    if menu == "main" and stats_str:
-        content.append(f"    {stats_str}\n", style="dim")
-
-    content.append("\n")
+    def p(s: str = "") -> None:
+        nonlocal n
+        console.print(s)
+        n += 1
 
     if menu == "main":
-        items = [("s", "specs")]
+        p()
+        p(title)
+        p(f"    {stats_str}" if stats_str else "")
+        p()
+        items = [_kw("s", "specs")]
         if has_context:
-            items += [("c", "code"), ("p", "project")]
-        items += [("q", "quit")]
-        _append_menu_items(content, items)
+            items += [_kw("c", "code"), _kw("p", "project")]
+        items.append(_kw("q", "quit"))
+        p("  " + "   ".join(items))
+        p()
+        p("  [dim]>[/dim]")
+        p()
+        p()
+        # 9 lines
 
     elif menu == "specs":
-        items = [("e", "new")]
+        p()
+        p(title)
+        p()
+        items = [_kw("e", "new")]
         if has_context:
-            items.append(("m", "modify"))
-        _append_menu_items(content, items)
-        content.append("\n  ")
-        content.append("Esc to go back\n", style="dim")
+            items.append(_kw("m", "modify"))
+        p("  " + "   ".join(items))
+        p()
+        p("  [dim]Esc to go back[/dim]")
+        p()
+        # 7 lines
 
     elif menu == "code":
-        _append_menu_items(content, [
-            ("g", "generate main"), ("r", "rebuild"), ("k", "compile"), ("x", "run"),
-        ])
-        content.append("\n  ")
-        content.append("Esc to go back\n", style="dim")
+        p()
+        p(title)
+        p()
+        p("  " + "   ".join([
+            _kw("g", "generate main"), _kw("r", "rebuild"),
+            _kw("k", "compile"), _kw("x", "run"),
+        ]))
+        p()
+        p("  [dim]Esc to go back[/dim]")
+        p()
+        # 7 lines
 
     elif menu == "project":
-        _append_menu_items(content, [("v", "view summary"), ("l", "language")])
-        content.append("\n  ")
-        content.append("Esc to go back\n", style="dim")
+        p()
+        p(title)
+        p()
+        p("  " + "   ".join([_kw("v", "view summary"), _kw("l", "language")]))
+        p()
+        p("  [dim]Esc to go back[/dim]")
+        p()
+        # 7 lines
 
     elif menu == "language":
-        current = live_state.get("context", {}) or {}
-        current_lang = current.get("language", CURRENT_LANGUAGE)
+        current_lang = (context or {}).get("language", CURRENT_LANGUAGE)
         lang_items = [
             ("1", "c++"), ("2", "python"), ("3", "rust"),
             ("4", "ocaml"), ("5", "go"), ("6", "typescript"),
         ]
-        lang_map_rev = {v: k for k, v in [
-            ("1", "c++"), ("2", "python"), ("3", "rust"),
-            ("4", "ocaml"), ("5", "go"), ("6", "typescript"),
-        ]}
+        p()
+        p(title)
+        p()
         for key_num, lang_name in lang_items:
             if lang_name == current_lang:
-                content.append(f"  [{key_num}] ", style="rgb(100,140,180)")
-                content.append(f"{lang_name}", style="bold bright_white")
-                content.append("  ←\n", style="dim")
+                p(f"  [rgb(100,140,180)][{key_num}][/rgb(100,140,180)]"
+                  f" [bold bright_white]{lang_name}[/bold bright_white]  [dim]←[/dim]")
             else:
-                content.append(f"  [{key_num}] ", style="rgb(100,140,180)")
-                content.append(f"{lang_name}\n", style="dim")
-        content.append("\n  ")
-        content.append("Esc to go back\n", style="dim")
+                p(f"  [rgb(100,140,180)][{key_num}][/rgb(100,140,180)] [dim]{lang_name}[/dim]")
+        p()
+        p("  [dim]Esc to go back[/dim]")
+        p()
+        # 12 lines
 
     elif menu == "select_spec":
-        entries = live_state.get("spec_entries", [])
-        idx = live_state.get("spec_idx", 0)
+        entries = state.get("spec_entries", [])
+        idx = state.get("spec_idx", 0)
+        p()
+        p(title)
+        p()
         for i, entry in enumerate(entries):
             name = entry.get("name", "?")
             spec_file = entry.get("spec_file", f"specs/{name}.lean")
             if i == idx:
-                content.append("  → ", style="rgb(100,140,180) bold")
-                content.append(f"{name:<20}", style="bright_white")
-                content.append(f"  {spec_file}\n", style="dim")
+                p(f"  [rgb(100,140,180) bold]→[/rgb(100,140,180) bold]"
+                  f" [bright_white]{name:<20}[/bright_white]  [dim]{spec_file}[/dim]")
             else:
-                content.append(f"    {name:<20}", style="dim")
-                content.append(f"  {spec_file}\n", style="dim")
-        content.append("\n  ")
-        content.append("↑↓ navigate   Enter select   Esc to go back\n", style="dim")
+                p(f"    [dim]{name:<20}  {spec_file}[/dim]")
+        p()
+        p("  [dim]↑↓ navigate   Enter select   Esc to go back[/dim]")
+        p()
+        # 6 + len(entries) lines
 
-    content.append("\n")
-    return Panel(content, border_style="dim")
+    return n
 
 
-def _transition(live_state: dict, key: str) -> str:
+def _transition(state: dict, key: str) -> str:
     """
-    Update live_state["menu"] based on key.
+    Update state["menu"] based on key.
     Returns an action string: "continue", "quit", "open_editor", "edit_spec",
-    "show_project", "select_language", "generate_main", "rebuild", "compile", "run".
+    "show_project", "apply_language", "generate_main", "rebuild", "compile", "run".
     """
-    menu = live_state["menu"]
-    has_context = live_state.get("context") is not None
+    menu = state["menu"]
+    has_context = state.get("context") is not None
 
     if menu == "main":
         if key in ("s", "S"):
-            live_state["menu"] = "specs"
+            state["menu"] = "specs"
         elif key in ("c", "C") and has_context:
-            live_state["menu"] = "code"
+            state["menu"] = "code"
         elif key in ("p", "P") and has_context:
-            live_state["menu"] = "project"
+            state["menu"] = "project"
         elif key in ("q", "Q", "ESC", "\x03", "\x04"):
             return "quit"
 
@@ -636,15 +660,14 @@ def _transition(live_state: dict, key: str) -> str:
             return "open_editor"
         elif key in ("m", "M") and has_context:
             entries = [
-                e for e in live_state["context"].get("functions", [])
+                e for e in state["context"].get("functions", [])
                 if e.get("kind") != "demo"
             ]
-            live_state["spec_entries"] = entries
-            live_state["spec_idx"] = 0
-            live_state["menu"] = "select_spec"
+            state["spec_entries"] = entries
+            state["spec_idx"] = 0
+            state["menu"] = "select_spec"
         elif key in ("ESC", "\x03"):
-            live_state["menu"] = "main"
-            live_state["needs_clear"] = True
+            state["menu"] = "main"
 
     elif menu == "code":
         if key in ("g", "G"):
@@ -656,17 +679,15 @@ def _transition(live_state: dict, key: str) -> str:
         elif key in ("x", "X"):
             return "run"
         elif key in ("ESC", "\x03"):
-            live_state["menu"] = "main"
-            live_state["needs_clear"] = True
+            state["menu"] = "main"
 
     elif menu == "project":
         if key in ("v", "V"):
             return "show_project"
         elif key in ("l", "L"):
-            live_state["menu"] = "language"
+            state["menu"] = "language"
         elif key in ("ESC", "\x03"):
-            live_state["menu"] = "main"
-            live_state["needs_clear"] = True
+            state["menu"] = "main"
 
     elif menu == "language":
         lang_map = {
@@ -674,29 +695,29 @@ def _transition(live_state: dict, key: str) -> str:
             "4": "ocaml", "5": "go", "6": "typescript",
         }
         if key in lang_map:
-            live_state["selected_language"] = lang_map[key]
-            live_state["menu"] = "main"
-            live_state["needs_clear"] = True
+            state["selected_language"] = lang_map[key]
+            state["menu"] = "main"
+            return "apply_language"
         elif key in ("ESC", "\x03"):
-            live_state["menu"] = "project"
+            state["menu"] = "project"
 
     elif menu == "select_spec":
-        entries = live_state.get("spec_entries", [])
+        entries = state.get("spec_entries", [])
         n = len(entries)
         if key == "\x1b[A" and n:
-            live_state["spec_idx"] = (live_state["spec_idx"] - 1) % n
+            state["spec_idx"] = (state["spec_idx"] - 1) % n
         elif key == "\x1b[B" and n:
-            live_state["spec_idx"] = (live_state["spec_idx"] + 1) % n
+            state["spec_idx"] = (state["spec_idx"] + 1) % n
         elif key in ("\r", "\n") and entries:
             return "edit_spec"
         elif key in ("ESC", "\x03"):
-            live_state["menu"] = "specs"
+            state["menu"] = "specs"
 
     return "continue"
 
 
 # ---------------------------------------------------------------------------
-# Action handlers (called with outer Live stopped, except generate/rebuild)
+# Action handlers
 # ---------------------------------------------------------------------------
 
 def _action_edit(live_state: dict, project_dir: Path, stacked: bool) -> None:
@@ -821,11 +842,11 @@ def _action_show_project(live_state: dict, project_dir: Path) -> None:
     live_state["menu"] = "main"
 
 
-def _action_generate_main(live_state: dict, live: Live, project_dir: Path, stacked: bool) -> None:
-    """Stream generate_main into the outer Live display."""
-    context = live_state.get("context")
+def _action_generate_main(state: dict, project_dir: Path, stacked: bool) -> None:
+    """Stream generate_main in its own Live display."""
+    context = state.get("context")
     if not context:
-        live_state["menu"] = "main"
+        state["menu"] = "main"
         return
 
     lang = context.get("language", CURRENT_LANGUAGE)
@@ -837,7 +858,6 @@ def _action_generate_main(live_state: dict, live: Live, project_dir: Path, stack
         ds.lang_fence = LANG_FENCE.get(lang, "cpp")
         ds.fn_name = "main"
     ds.handle_event("generating", {})
-    live.update(_Renderable(ds, stacked))
 
     done = threading.Event()
 
@@ -862,19 +882,20 @@ def _action_generate_main(live_state: dict, live: Live, project_dir: Path, stack
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
-    done.wait()
-    live.update(build_renderable(ds, stacked))
+    with Live(_Renderable(ds, stacked), console=console, refresh_per_second=15, transient=False) as live:
+        done.wait()
+        live.update(build_renderable(ds, stacked))
     t.join()
     time.sleep(1.5)
-    live_state["context"] = load_context(project_dir)
-    live_state["menu"] = "main"
+    state["context"] = load_context(project_dir)
+    state["menu"] = "main"
 
 
-def _action_rebuild(live_state: dict, live: Live, project_dir: Path, stacked: bool) -> None:
-    """Rebuild all specs, streaming each into the outer Live display."""
-    context = live_state.get("context")
+def _action_rebuild(state: dict, project_dir: Path, stacked: bool) -> None:
+    """Rebuild all specs, each in its own Live display."""
+    context = state.get("context")
     if not context:
-        live_state["menu"] = "main"
+        state["menu"] = "main"
         return
 
     lang = CURRENT_LANGUAGE
@@ -894,7 +915,6 @@ def _action_rebuild(live_state: dict, live: Live, project_dir: Path, stacked: bo
             ds.lang_fence = LANG_FENCE.get(lang, "cpp")
             ds.fn_name = fn_name
         ds.handle_event("generating", {})
-        live.update(_Renderable(ds, stacked))
 
         done = threading.Event()
 
@@ -905,47 +925,14 @@ def _action_rebuild(live_state: dict, live: Live, project_dir: Path, stacked: bo
 
         t = threading.Thread(target=_run, daemon=True)
         t.start()
-        done.wait()
-        live.update(build_renderable(ds, stacked))
+        with Live(_Renderable(ds, stacked), console=console, refresh_per_second=15, transient=False) as live:
+            done.wait()
+            live.update(build_renderable(ds, stacked))
         t.join()
         time.sleep(0.5)
 
-    live_state["context"] = load_context(project_dir)
-    live_state["menu"] = "main"
-
-
-def _prompt_language() -> str:
-    """
-    Display language selection sub-menu.
-    Returns the selected language key.
-    """
-    lang_map = {
-        "1": "c++",
-        "2": "python",
-        "3": "rust",
-        "4": "ocaml",
-        "5": "go",
-        "6": "typescript",
-    }
-
-    console.print()
-    console.print("  Select output language:")
-    console.print("  [1] c++        [2] python")
-    console.print("  [3] rust       [4] ocaml")
-    console.print("  [5] go         [6] typescript")
-    console.print()
-
-    while True:
-        console.print("  > ", end="")
-        try:
-            key = _read_key()
-        except (EOFError, KeyboardInterrupt):
-            console.print()
-            return "c++"
-        console.print()
-        if key in lang_map:
-            return lang_map[key]
-        # unknown key: reshow prompt only
+    state["context"] = load_context(project_dir)
+    state["menu"] = "main"
 
 
 # ---------------------------------------------------------------------------
@@ -1063,7 +1050,7 @@ def main():
     if context:
         CURRENT_LANGUAGE = context.get("language", CURRENT_LANGUAGE)
 
-    live_state: dict = {
+    state: dict = {
         "menu": "main",
         "context": context,
         "project_dir": project_dir,
@@ -1073,56 +1060,58 @@ def main():
         "stacked": stacked,
     }
 
+    last_n = 0
+
     try:
-        with Live(
-            _render_menu_state(live_state),
-            console=console,
-            refresh_per_second=10,
-            transient=False,
-        ) as live:
-            while True:
-                if live_state.pop("needs_clear", False):
-                    console.clear()
-                if "selected_language" in live_state:
-                    CURRENT_LANGUAGE = live_state.pop("selected_language")
-                live.update(_render_menu_state(live_state))
-                key = _read_key_safe()
-                action = _transition(live_state, key)
+        while True:
+            if last_n > 0:
+                clear_lines(last_n)
+            last_n = print_menu(state)
 
-                if action == "quit":
-                    break
+            key = _read_key_safe()
+            action = _transition(state, key)
 
-                elif action == "open_editor":
-                    live.stop()
-                    _action_edit(live_state, project_dir, stacked)
-                    console.clear()
-                    live.start()
+            if action == "quit":
+                clear_lines(last_n)
+                last_n = 0
+                break
 
-                elif action == "edit_spec":
-                    live.stop()
-                    _action_edit_spec(live_state, project_dir)
-                    console.clear()
-                    live.start()
+            elif action == "open_editor":
+                clear_lines(last_n)
+                last_n = 0
+                _action_edit(state, project_dir, stacked)
 
-                elif action == "show_project":
-                    live.stop()
-                    _action_show_project(live_state, project_dir)
-                    console.clear()
-                    live.start()
+            elif action == "edit_spec":
+                clear_lines(last_n)
+                last_n = 0
+                _action_edit_spec(state, project_dir)
 
-                elif action == "generate_main":
-                    _action_generate_main(live_state, live, project_dir, stacked)
+            elif action == "show_project":
+                clear_lines(last_n)
+                last_n = 0
+                _action_show_project(state, project_dir)
 
-                elif action == "rebuild":
-                    _action_rebuild(live_state, live, project_dir, stacked)
+            elif action == "apply_language":
+                CURRENT_LANGUAGE = state.pop("selected_language", CURRENT_LANGUAGE)
 
-                elif action in ("compile", "run"):
-                    pass  # not yet implemented
+            elif action == "generate_main":
+                clear_lines(last_n)
+                last_n = 0
+                _action_generate_main(state, project_dir, stacked)
 
-                # "continue" — live.update at top of loop
+            elif action == "rebuild":
+                clear_lines(last_n)
+                last_n = 0
+                _action_rebuild(state, project_dir, stacked)
+
+            elif action in ("compile", "run"):
+                pass  # not yet implemented
+
+            # "continue" — redraw at top of loop
 
     except KeyboardInterrupt:
-        pass
+        if last_n > 0:
+            clear_lines(last_n)
 
     console.print("\n[dim]Bye.[/dim]")
     sys.exit(0)

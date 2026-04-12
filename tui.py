@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -516,14 +517,31 @@ def _print_intro() -> None:
     console.print()
 
 
+def _read_key_safe() -> str:
+    """
+    Read one key from stdin using readchar, with proper Esc detection on Mac.
+    - Bare Esc (no follow-up chars within 50ms) → returns 'ESC'
+    - Arrow sequences → returns '\x1b[A', '\x1b[B', '\x1b[C', '\x1b[D'
+    - Any other char → returns it as-is
+    """
+    import readchar as _rc
+    ch = _rc.readchar()
+    if ch == "\x1b":
+        if select.select([sys.stdin], [], [], 0.05)[0]:
+            ch2 = _rc.readchar()
+            if ch2 == "[":
+                ch3 = _rc.readchar()
+                return f"\x1b[{ch3}"
+        return "ESC"
+    return ch
+
+
 def _submenu(items: list[tuple[str, str, str]]) -> str | None:
     """
     Display a static sub-menu with Rich Live (no scroll, no extra lines).
     items: list of (key_char, label, action).
     Returns action string, or None on Esc.
     """
-    import readchar
-
     content = Text("\n  ")
     for i, (key, label, _) in enumerate(items):
         if i > 0:
@@ -537,11 +555,11 @@ def _submenu(items: list[tuple[str, str, str]]) -> str | None:
 
     with Live(panel, console=console, refresh_per_second=10, transient=True):
         while True:
-            key = readchar.readkey()
+            key = _read_key_safe()
             for k, _, action in items:
                 if key.lower() == k.lower():
                     return action
-            if key in ("\x1b", "\x03", "\x04"):
+            if key in ("ESC", "\x03", "\x04"):
                 return None
 
 

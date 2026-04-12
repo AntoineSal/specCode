@@ -613,31 +613,33 @@ def _prompt_language() -> str:
 # ---------------------------------------------------------------------------
 
 def _read_key_safe() -> str:
-    """Read one keypress using buffer; returns arrow sequences or decoded char."""
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        ch = sys.stdin.buffer.read(1)
-        if ch == b"\x1b":
-            seq = b"\x1b"
-            for _ in range(4):
-                r, _, _ = select.select([sys.stdin], [], [], 0.02)
-                if not r:
-                    break
-                seq += sys.stdin.buffer.read(1)
-            if seq == b"\x1b[A":
-                return "\x1b[A"
-            if seq == b"\x1b[B":
-                return "\x1b[B"
-            if seq == b"\x1b[C":
-                return "\x1b[C"
-            if seq == b"\x1b[D":
-                return "\x1b[D"
-            return "IGNORED"
-        return ch.decode("utf-8", errors="replace")
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    """Read one keypress via /dev/tty; returns arrow sequences or decoded char."""
+    with open("/dev/tty", "rb") as tty_f:
+        fd = tty_f.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = tty_f.read(1)
+            if ch == b"\x1b":
+                seq = ch
+                r, _, _ = select.select([tty_f], [], [], 0.1)
+                if r:
+                    seq += tty_f.read(1)
+                    r2, _, _ = select.select([tty_f], [], [], 0.05)
+                    if r2:
+                        seq += tty_f.read(1)
+                if seq == b"\x1b[A":
+                    return "\x1b[A"
+                if seq == b"\x1b[B":
+                    return "\x1b[B"
+                if seq == b"\x1b[C":
+                    return "\x1b[C"
+                if seq == b"\x1b[D":
+                    return "\x1b[D"
+                return "IGNORED"
+            return ch.decode("utf-8", errors="replace")
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 def _build_spec_list(entries: list, idx: int) -> Panel:

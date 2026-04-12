@@ -543,37 +543,69 @@ def render_menu(project_dir: Path) -> str:
 
 
 def _prompt_language() -> str:
-    """
-    Display language selection sub-menu.
-    Returns the selected language key.
-    """
-    lang_map = {
-        "1": "c++",
-        "2": "python",
-        "3": "rust",
-        "4": "ocaml",
-        "5": "go",
-        "6": "typescript",
-    }
+    """Display language selector with ANSI navigation. Returns selected language."""
+    lang_entries = [
+        ("1", "c++"),
+        ("2", "python"),
+        ("3", "rust"),
+        ("4", "ocaml"),
+        ("5", "go"),
+        ("6", "typescript"),
+    ]
+    current = CURRENT_LANGUAGE
+    idx = next((i for i, (_, l) in enumerate(lang_entries) if l == current), 0)
 
-    console.print()
-    console.print("  Select output language:")
-    console.print("  [1] c++        [2] python")
-    console.print("  [3] rust       [4] ocaml")
-    console.print("  [5] go         [6] typescript")
-    console.print()
+    def render(i: int) -> list[str]:
+        lines = [""]
+        lines.append("  select language")
+        lines.append("")
+        for j, (key, lang) in enumerate(lang_entries):
+            if j == i:
+                lines.append(f"  \x1b[97;1m→ [{key}] {lang:<15}\x1b[0m")
+            else:
+                lines.append(f"  \x1b[2m  [{key}] {lang:<15}\x1b[0m")
+        lines.append("")
+        lines.append("  \x1b[2m↑↓ or key   Enter select   q cancel\x1b[0m")
+        lines.append("")
+        return lines
 
+    lines = render(idx)
+    for line in lines:
+        sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+    n_lines = len(lines)
+
+    selected = None
     while True:
-        console.print("  > ", end="")
-        try:
-            key = _read_key()
-        except (EOFError, KeyboardInterrupt):
-            console.print()
-            return "c++"
-        console.print()
-        if key in lang_map:
-            return lang_map[key]
-        # unknown key: reshow prompt only
+        key = _read_key_safe()
+        if key in ("\x1b[A", "k"):
+            idx = (idx - 1) % len(lang_entries)
+        elif key in ("\x1b[B", "j"):
+            idx = (idx + 1) % len(lang_entries)
+        elif key == "\r":
+            selected = lang_entries[idx][1]
+            break
+        elif key in ("q", "Q", "\x03"):
+            break
+        else:
+            for i, (k, lang) in enumerate(lang_entries):
+                if key == k:
+                    selected = lang
+                    idx = i
+                    break
+            if selected:
+                break
+            continue
+
+        sys.stdout.write(f"\x1b[{n_lines}A\x1b[0J")
+        lines = render(idx)
+        for line in lines:
+            sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
+    sys.stdout.write(f"\x1b[{n_lines}A\x1b[0J")
+    sys.stdout.flush()
+    return selected if selected else CURRENT_LANGUAGE
 
 
 # ---------------------------------------------------------------------------
@@ -581,7 +613,7 @@ def _prompt_language() -> str:
 # ---------------------------------------------------------------------------
 
 def _read_key_safe() -> str:
-    """Read one keypress; returns full ANSI sequence for arrows, 'ESC' for bare Esc."""
+    """Read one keypress; returns full ANSI sequence for arrows, raw char otherwise."""
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
@@ -594,8 +626,8 @@ def _read_key_safe() -> str:
                 if ch2 == "[":
                     ch3 = sys.stdin.read(1)
                     return "\x1b[" + ch3
-                return "\x1b" + ch2
-            return "ESC"
+                return ch  # ignore other esc sequences
+            return ch  # bare esc: ignore
         return ch
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -656,7 +688,7 @@ def _action_modify_spec(context: dict, project_dir: Path) -> None:
             idx = (idx + 1) % len(entries)
         elif key == "\r":
             break
-        elif key in ("q", "Q", "ESC", "\x03"):
+        elif key in ("q", "Q", "\x03"):
             idx = -1
             break
         else:

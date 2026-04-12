@@ -988,6 +988,141 @@ def run_pipeline(
 
 
 # ---------------------------------------------------------------------------
+# Demo main generation
+# ---------------------------------------------------------------------------
+
+def generate_main(
+    context: dict,
+    project_dir: Path,
+    target_language: str = "c++",
+    on_chunk=None,
+) -> str:
+    """
+    Generate a demonstration main file illustrating all project functions.
+    Writes src/main.{ext} and adds a kind="demo" entry to context.
+    Returns the generated code.
+    """
+    cfg = LANGUAGE_CONFIGS.get(target_language, LANGUAGE_CONFIGS["c++"])
+
+    all_entries = context.get("functions", [])
+    type_entries = [f for f in all_entries if f.get("kind") == "type"]
+    fn_entries = [f for f in all_entries if f.get("kind", "function") == "function"]
+
+    desc_lines: list[str] = []
+
+    if type_entries:
+        desc_lines.append("Types defined in this project:")
+        for t in type_entries:
+            name = t["name"]
+            fields = t.get("fields", [])
+            mapped: list[str] = []
+            for field in fields:
+                if ":" in field:
+                    fname, ftype = field.split(":", 1)
+                    mapped.append(f"{fname.strip()}: {_map_lean_type(ftype.strip(), target_language)}")
+                else:
+                    mapped.append(field)
+            desc_lines.append(f"  struct {name} {{ {', '.join(mapped)} }}")
+            if target_language == "c++":
+                desc_lines.append(f'  (include: #include "{name}.hpp")')
+        desc_lines.append("")
+
+    if fn_entries:
+        desc_lines.append("Functions to demonstrate (in dependency order):")
+        for fn in fn_entries:
+            sig = fn.get("signature", fn["name"])
+            theorems = fn.get("theorems", [])
+            code_file = fn.get("code_file", "")
+            desc_lines.append(f"  {sig}")
+            if theorems:
+                desc_lines.append(f"    // satisfies: {', '.join(theorems)}")
+            if code_file and target_language == "c++":
+                hpp = code_file.replace(".cpp", ".hpp").replace("src/", "")
+                desc_lines.append(f'    // (include: #include "{hpp}")')
+        desc_lines.append("")
+
+    project_desc = "\n".join(desc_lines)
+
+    system_prompt = (
+        "Generate a complete, self-contained main file that "
+        "demonstrates all functions in this project.\n"
+        "- Include all necessary headers\n"
+        "- Create realistic example data\n"
+        "- Call each function and print results\n"
+        "- Show the full pipeline from data creation to final output\n"
+        "- Add clear comments explaining what each section demonstrates\n"
+        "- The main should compile and run without any modifications"
+    )
+
+    user_content = (
+        f"Project: {context.get('project', 'project')}\n"
+        f"Language: {cfg['display']}\n\n"
+        f"{project_desc}\n"
+        f"Generate a complete {cfg['display']} main file demonstrating all these functions."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+
+    client = get_client()
+    token_usage = {"codestral_input": 0, "codestral_output": 0}
+    accumulated: list[str] = []
+
+    def _call():
+        accumulated.clear()
+        stream = client.chat.stream(
+            model=CODESTRAL_MODEL,
+            messages=messages,
+            timeout_ms=API_TIMEOUT * 1000,
+        )
+        for event in stream:
+            chunk = event.data
+            if chunk.choices:
+                delta = chunk.choices[0].delta.content or ""
+                if delta:
+                    accumulated.append(delta)
+                    if on_chunk:
+                        on_chunk(delta)
+            if chunk.usage:
+                token_usage["codestral_input"] += chunk.usage.prompt_tokens or 0
+                token_usage["codestral_output"] += chunk.usage.completion_tokens or 0
+
+    api_call_with_retry(_call)
+    raw = "".join(accumulated)
+
+    # Extract first fenced code block
+    m = re.search(rf"```(?:{re.escape(cfg['fence'])}|[a-zA-Z+]*)\n(.*?)```", raw, re.DOTALL)
+    code = m.group(1).strip() if m else raw.strip()
+
+    # Write src/main.{ext}
+    src_dir = project_dir / "src"
+    src_dir.mkdir(exist_ok=True)
+    (src_dir / f"main{cfg['ext']}").write_text(code, encoding="utf-8")
+
+    # Add/update demo entry in context
+    demo_entry = {
+        "name": "main",
+        "kind": "demo",
+        "code_file": f"src/main{cfg['ext']}",
+        "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "language": target_language,
+    }
+    fns = context.get("functions", [])
+    for i, fn in enumerate(fns):
+        if fn.get("name") == "main" and fn.get("kind") == "demo":
+            fns[i] = demo_entry
+            break
+    else:
+        fns.append(demo_entry)
+    context["functions"] = fns
+    save_context(project_dir, context)
+
+    return code
+
+
+# ---------------------------------------------------------------------------
 # CLI fallback
 # ---------------------------------------------------------------------------
 

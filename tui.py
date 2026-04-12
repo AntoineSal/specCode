@@ -5,8 +5,10 @@ Terminal interface for the speccode pipeline.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -28,12 +30,15 @@ from orchestrator import (
     check_stale,
     clean_lean_error,
     count_blocks,
+    generate_main,
     generate_specs_md,
     init_context,
+    LANGUAGE_CONFIGS,
     load_api_key,
     load_context,
     parse_spec,
     run_pipeline,
+    save_context,
 )
 
 console = Console()
@@ -70,6 +75,93 @@ def _read_key() -> str:
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
     return ch
+
+
+def _read_key_ext() -> str:
+    """Read a keypress; returns 'up', 'down', 'enter', 'esc', or the char."""
+    fd = sys.stdin.fileno()
+    try:
+        old = termios.tcgetattr(fd)
+    except termios.error:
+        line = sys.stdin.readline() or "\n"
+        return "enter" if line.strip() == "" else line[0]
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            if select.select([sys.stdin], [], [], 0.05)[0]:
+                ch2 = sys.stdin.read(1)
+                if ch2 == "[" and select.select([sys.stdin], [], [], 0.05)[0]:
+                    ch3 = sys.stdin.read(1)
+                    if ch3 == "A":
+                        return "up"
+                    elif ch3 == "B":
+                        return "down"
+            return "esc"
+        if ch in ("\r", "\n"):
+            return "enter"
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _clear_lines(n: int) -> None:
+    """Move cursor up n lines and clear each one."""
+    for _ in range(n):
+        sys.stdout.write("\033[A\033[2K")
+    sys.stdout.flush()
+
+
+def _select_spec(entries: list[dict]) -> dict | None:
+    """
+    Keyboard-navigable list of specs.
+    Returns selected entry dict, or None if the user pressed Esc.
+    """
+    if not entries:
+        return None
+
+    idx = 0
+    first_draw = True
+    # lines drawn: blank + title + blank + N entries + blank + hint + blank = N + 6
+    n_total = len(entries) + 6
+
+    while True:
+        if not first_draw:
+            _clear_lines(n_total)
+        first_draw = False
+
+        console.print()
+        console.print("  Select spec to modify:")
+        console.print()
+        for i, entry in enumerate(entries):
+            name = entry.get("name", "?")
+            spec_file = entry.get("spec_file", f"specs/{name}.lean")
+            if i == idx:
+                line = Text("  ")
+                line.append("→ ", style="rgb(100,140,180) bold")
+                line.append(f"{name:<20}", style="rgb(100,140,180)")
+                line.append(f"  {spec_file}", style="dim")
+            else:
+                line = Text("    ")
+                line.append(f"{name:<20}", style="dim")
+                line.append(f"  {spec_file}", style="dim")
+            console.print(line)
+        console.print()
+        console.print("  [dim]↑↓ navigate   Enter select   Esc cancel[/dim]")
+        console.print()
+
+        key = _read_key_ext()
+
+        if key == "up":
+            idx = (idx - 1) % len(entries)
+        elif key == "down":
+            idx = (idx + 1) % len(entries)
+        elif key == "enter":
+            _clear_lines(n_total)
+            return entries[idx]
+        elif key == "esc":
+            _clear_lines(n_total)
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -466,7 +558,7 @@ def _print_intro() -> None:
 def render_menu(project_dir: Path) -> str:
     """
     Load context, display project header + menu, wait for a keypress.
-    Returns: 'edit', 'language', 'project', 'rebuild', or 'quit'.
+    Returns: 'edit', 'modify', 'generate_main', 'language', 'project', 'rebuild', or 'quit'.
     Updates CURRENT_LANGUAGE from context if available.
     """
     global CURRENT_LANGUAGE
@@ -505,7 +597,7 @@ def render_menu(project_dir: Path) -> str:
     # Build menu line
     items = [("e", "new spec")]
     if has_context:
-        items += [("r", "rebuild"), ("p", "project")]
+        items += [("m", "modify spec"), ("r", "rebuild"), ("g", "generate main"), ("p", "project")]
     items += [("l", "language"), ("q", "quit")]
 
     menu_text = Text("  ")
@@ -529,12 +621,16 @@ def render_menu(project_dir: Path) -> str:
         console.print()
         if key in ("e", "E", "\r", "\n"):
             return "edit"
-        if key in ("l", "L"):
-            return "language"
-        if key in ("p", "P") and has_context:
-            return "project"
+        if key in ("m", "M") and has_context:
+            return "modify"
         if key in ("r", "R") and has_context:
             return "rebuild"
+        if key in ("g", "G") and has_context:
+            return "generate_main"
+        if key in ("p", "P") and has_context:
+            return "project"
+        if key in ("l", "L"):
+            return "language"
         if key in ("q", "Q", "\x03", "\x04"):  # q, Ctrl+C, Ctrl+D
             return "quit"
         # unknown key: reshow prompt only
@@ -798,6 +894,106 @@ def main():
                 context = load_context(project_dir)
                 emit_ctx = {"fn_count": len(context.get("functions", [])) if context else 0}
                 console.print(f"  [green]✓ rebuild done — {emit_ctx['fn_count']} function(s)[/green]")
+                continue
+
+            if action == "modify":
+                context = load_context(project_dir)
+                if not context:
+                    continue
+                entries = [e for e in context.get("functions", []) if e.get("kind") != "demo"]
+                if not entries:
+                    console.print("  [yellow]No specs found.[/yellow]")
+                    continue
+                selected = _select_spec(entries)
+                if selected is None:
+                    continue
+                fn_name = selected["name"]
+                spec_file_path = project_dir / selected.get("spec_file", f"specs/{fn_name}.lean")
+                editor = os.environ.get("EDITOR", "nano")
+                console.print(f"  [dim]Opening {spec_file_path.name}...[/dim]")
+                try:
+                    subprocess.run([editor, str(spec_file_path)])
+                except FileNotFoundError:
+                    console.print(f"  [red]Editor not found: {editor}[/red]")
+                    continue
+                if not spec_file_path.exists():
+                    continue
+                new_content = spec_file_path.read_text(encoding="utf-8")
+                new_hash = hashlib.sha256(new_content.encode()).hexdigest()[:8]
+                old_hash = selected.get("spec_hash", "")
+                if new_hash != old_hash:
+                    ctx2 = load_context(project_dir)
+                    if ctx2:
+                        for fn in ctx2.get("functions", []):
+                            if fn.get("name") == fn_name:
+                                fn["spec_hash"] = new_hash
+                                fn["stale"] = True
+                                break
+                        save_context(project_dir, ctx2)
+                    console.print("  [yellow]spec updated — run [r] to rebuild[/yellow]")
+                context = load_context(project_dir)
+                continue
+
+            if action == "generate_main":
+                context = load_context(project_dir)
+                if not context:
+                    continue
+                lang = context.get("language", CURRENT_LANGUAGE)
+                cfg_obj = LANGUAGE_CONFIGS.get(lang, LANGUAGE_CONFIGS["c++"])
+
+                state = DisplayState()
+                with state._lock:
+                    state.validation_state = "valid"
+                    state.lang_fence = LANG_FENCE.get(lang, "cpp")
+                    state.fn_name = "main"
+                state.handle_event("generating", {})
+
+                gen_done = threading.Event()
+                gen_error: list[str] = []
+
+                def _gen(_ctx=context, _lang=lang, _cfg=cfg_obj, _state=state, _done=gen_done, _err=gen_error):
+                    try:
+                        def _on_chunk(chunk: str):
+                            _state.handle_event("streaming", {"chunk": chunk})
+                        code = generate_main(
+                            _ctx,
+                            project_dir,
+                            target_language=_lang,
+                            on_chunk=_on_chunk,
+                        )
+                        _state.handle_event("done", {
+                            "code": code,
+                            "fn_name": "main",
+                            "src_file": str(project_dir / f"src/main{_cfg['ext']}"),
+                            "spec_file": "",
+                            "cost": {"cost_total": 0.0, "codestral_tokens": 0},
+                            "lang_fence": LANG_FENCE.get(_lang, "cpp"),
+                            "lang_ext": _cfg["ext"],
+                            "output_dir": str(project_dir),
+                        })
+                    except Exception as e:
+                        _err.append(str(e))
+                        _state.handle_event("error", {"message": str(e)})
+                    _done.set()
+
+                t = threading.Thread(target=_gen, daemon=True)
+                t.start()
+
+                with Live(
+                    _Renderable(state, stacked),
+                    console=console,
+                    refresh_per_second=15,
+                    transient=False,
+                ) as live:
+                    gen_done.wait()
+                    live.update(build_renderable(state, stacked))
+
+                t.join()
+
+                if not gen_error:
+                    console.print(f"  [green]✓ saved to src/main{cfg_obj['ext']}[/green]")
+
+                context = load_context(project_dir)
                 continue
 
             # action == "edit"

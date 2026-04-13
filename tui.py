@@ -752,6 +752,134 @@ def _action_modify_spec(context: dict, project_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Build submenu
+# ---------------------------------------------------------------------------
+
+_BUILD_ALL = "__build_all__"
+_GEN_MAIN  = "__generate_main__"
+
+
+def _spec_status(entry: dict, project_dir: Path) -> tuple[str, str]:
+    """Return (icon, ansi_color) reflecting the build status of a spec entry."""
+    code_file = entry.get("code_file", "")
+    if not code_file or not (project_dir / code_file).exists():
+        return "○", "\x1b[2m"        # no code yet
+    if entry.get("stale"):
+        return "~", "\x1b[33m"       # stale (spec changed after last build)
+    return "✓", "\x1b[32m"           # up to date
+
+
+def _action_build_menu(context: dict, project_dir: Path, language: str, stacked: bool) -> None:
+    """Interactive build submenu: pick a spec, generate main, or build all."""
+    spec_entries = [e for e in context.get("functions", []) if e.get("kind") != "demo"]
+
+    # All navigable items: specs + separator-specials
+    items: list[dict] = spec_entries + [
+        {"name": _GEN_MAIN,  "_label": "generate main"},
+        {"name": _BUILD_ALL, "_label": "build all"},
+    ]
+
+    idx = 0
+
+    def render(i: int) -> list[str]:
+        lines = ["", "  build", ""]
+        for j, item in enumerate(items):
+            sel = (j == i)
+            arrow = "→ " if sel else "  "
+            dim_on  = "\x1b[97;1m" if sel else "\x1b[2m"
+            dim_off = "\x1b[0m"
+
+            if "_label" in item:
+                # Separator before special items
+                if j == len(spec_entries):
+                    lines.append("")
+                lines.append(f"  {dim_on}{arrow}{item['_label']}{dim_off}")
+            else:
+                icon, col = _spec_status(item, project_dir)
+                name = item.get("name", "?")
+                spec_file = item.get("spec_file", f"specs/{name}.lean")
+                icon_str = f"{col}{icon}\x1b[0m"
+                lines.append(f"  {dim_on}{arrow}{dim_off}{icon_str}  {dim_on}{name:<20}{dim_off}  \x1b[2m{spec_file}\x1b[0m")
+
+        lines.append("")
+        lines.append("  \x1b[2m↑↓   Enter select   q cancel\x1b[0m")
+        lines.append("")
+        return lines
+
+    lines = render(idx)
+    for line in lines:
+        sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+    n_lines = len(lines)
+
+    selected: dict | None = None
+    while True:
+        key = _read_key_safe()
+        if key in ("\x1b[A", "k"):
+            idx = (idx - 1) % len(items)
+        elif key in ("\x1b[B", "j"):
+            idx = (idx + 1) % len(items)
+        elif key == "\r":
+            selected = items[idx]
+            break
+        elif key in ("q", "Q", "\x03"):
+            break
+        else:
+            continue
+        sys.stdout.write(f"\x1b[{n_lines}A\x1b[0J")
+        lines = render(idx)
+        for line in lines:
+            sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
+    sys.stdout.write(f"\x1b[{n_lines}A\x1b[0J")
+    sys.stdout.flush()
+
+    if selected is None:
+        return
+
+    name = selected["name"]
+
+    if name == _GEN_MAIN:
+        ctx = load_context(project_dir)
+        if ctx:
+            _action_generate_main(ctx, project_dir, language)
+
+    elif name == _BUILD_ALL:
+        ctx = load_context(project_dir)
+        if not ctx:
+            return
+        ordered = topo_sort_specs(ctx)
+        console.print(f"  [rgb(100,140,180)]Building {len(ordered)} spec(s)...[/rgb(100,140,180)]")
+        for fn in ordered:
+            fn_name = fn["name"]
+            spec_path = project_dir / fn.get("spec_file", f"specs/{fn_name}.lean")
+            if not spec_path.exists():
+                console.print(f"  [yellow]skip {fn_name}: spec not found[/yellow]")
+                continue
+            console.print(f"  [dim]→ {fn_name}[/dim]")
+            state = DisplayState()
+            validate_and_generate(spec_path.read_text(encoding="utf-8"), state, stacked, language)
+        ctx = load_context(project_dir)
+        if ctx and any(f.get("kind") != "demo" for f in ctx.get("functions", [])):
+            console.print("  [dim]→ main[/dim]")
+            _action_generate_main(ctx, project_dir, language)
+        ctx = load_context(project_dir)
+        fn_count = len([f for f in ctx.get("functions", []) if f.get("kind") != "demo"]) if ctx else 0
+        console.print(f"  [green]✓ build all done — {fn_count} spec(s) + main[/green]")
+
+    else:
+        # Single spec
+        spec_path = project_dir / selected.get("spec_file", f"specs/{name}.lean")
+        if not spec_path.exists():
+            console.print(f"  [red]Spec not found: {spec_path}[/red]")
+            return
+        console.print(f"  [dim]→ {name}[/dim]")
+        state = DisplayState()
+        validate_and_generate(spec_path.read_text(encoding="utf-8"), state, stacked, language)
+
+
+# ---------------------------------------------------------------------------
 # Generate main action
 # ---------------------------------------------------------------------------
 
@@ -1232,29 +1360,7 @@ def main():
                 if not context:
                     console.print("  [yellow]No context found.[/yellow]")
                     continue
-                ordered = topo_sort_specs(context)
-                if not ordered:
-                    console.print("  [yellow]No specs to build.[/yellow]")
-                    continue
-                console.print(f"  [rgb(100,140,180)]Building {len(ordered)} spec(s)...[/rgb(100,140,180)]")
-                for fn in ordered:
-                    fn_name = fn["name"]
-                    spec_path = project_dir / fn.get("spec_file", f"specs/{fn_name}.lean")
-                    if not spec_path.exists():
-                        console.print(f"  [yellow]skip {fn_name}: spec not found[/yellow]")
-                        continue
-                    console.print(f"  [dim]→ {fn_name}[/dim]")
-                    spec_text = spec_path.read_text(encoding="utf-8")
-                    state = DisplayState()
-                    validate_and_generate(spec_text, state, stacked, CURRENT_LANGUAGE)
-                # Generate main after all specs
-                context = load_context(project_dir)
-                if context and any(f.get("kind") != "demo" for f in context.get("functions", [])):
-                    console.print("  [dim]→ main[/dim]")
-                    _action_generate_main(context, project_dir, CURRENT_LANGUAGE)
-                context = load_context(project_dir)
-                fn_count = len([f for f in context.get("functions", []) if f.get("kind") != "demo"]) if context else 0
-                console.print(f"  [green]✓ build done — {fn_count} spec(s) + main[/green]")
+                _action_build_menu(context, project_dir, CURRENT_LANGUAGE, stacked)
                 continue
 
             if action == "generate_main":

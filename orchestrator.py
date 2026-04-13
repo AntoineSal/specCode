@@ -991,6 +991,26 @@ def run_pipeline(
 # Demo main generation
 # ---------------------------------------------------------------------------
 
+def _build_main_imports(entries: list[dict], language: str) -> list[str]:
+    """Return the mandatory import/include lines for a main file."""
+    lines: list[str] = []
+    for fn in entries:
+        name = fn["name"]
+        if language == "c++":
+            lines.append(f'#include "{name}.hpp"')
+        elif language == "python":
+            lines.append(f"from {name} import {name}")
+        elif language == "rust":
+            lines.append(f"mod {name};")
+            lines.append(f"use {name}::{name};")
+        elif language == "ocaml":
+            lines.append(f"open {name[0].upper() + name[1:]}")
+        elif language == "typescript":
+            lines.append(f'import {{ {name} }} from "./{name}";')
+        # Go: same package, no imports needed
+    return lines
+
+
 def generate_main(
     context: dict,
     project_dir: Path,
@@ -1007,58 +1027,55 @@ def generate_main(
     all_entries = context.get("functions", [])
     type_entries = [f for f in all_entries if f.get("kind") == "type"]
     fn_entries = [f for f in all_entries if f.get("kind", "function") == "function"]
+    callable_entries = type_entries + fn_entries
 
-    desc_lines: list[str] = []
+    # Read the actual source files so the model sees exact APIs
+    existing_sources: list[str] = []
+    for entry in callable_entries:
+        code_path = project_dir / entry.get("code_file", "")
+        if code_path.exists():
+            src = code_path.read_text(encoding="utf-8").strip()
+            existing_sources.append(
+                f"=== {entry.get('code_file', entry['name'])} ===\n{src}"
+            )
 
-    if type_entries:
-        desc_lines.append("Types defined in this project:")
-        for t in type_entries:
-            name = t["name"]
-            fields = t.get("fields", [])
-            mapped: list[str] = []
-            for field in fields:
-                if ":" in field:
-                    fname, ftype = field.split(":", 1)
-                    mapped.append(f"{fname.strip()}: {_map_lean_type(ftype.strip(), target_language)}")
-                else:
-                    mapped.append(field)
-            desc_lines.append(f"  struct {name} {{ {', '.join(mapped)} }}")
-            if target_language == "c++":
-                desc_lines.append(f'  (include: #include "{name}.hpp")')
-        desc_lines.append("")
+    # Build the mandatory import block
+    import_lines = _build_main_imports(callable_entries, target_language)
+    import_block = "\n".join(import_lines)
 
-    if fn_entries:
-        desc_lines.append("Functions to demonstrate (in dependency order):")
-        for fn in fn_entries:
-            sig = fn.get("signature", fn["name"])
-            theorems = fn.get("theorems", [])
-            code_file = fn.get("code_file", "")
-            desc_lines.append(f"  {sig}")
-            if theorems:
-                desc_lines.append(f"    // satisfies: {', '.join(theorems)}")
-            if code_file and target_language == "c++":
-                hpp = code_file.replace(".cpp", ".hpp").replace("src/", "")
-                desc_lines.append(f'    // (include: #include "{hpp}")')
-        desc_lines.append("")
-
-    project_desc = "\n".join(desc_lines)
+    # Describe each function to demonstrate
+    fn_desc: list[str] = []
+    for fn in fn_entries:
+        sig = fn.get("signature", fn["name"])
+        theorems = fn.get("theorems", [])
+        fn_desc.append(f"  {sig}")
+        if theorems:
+            fn_desc.append(f"    // proves: {', '.join(theorems)}")
 
     system_prompt = (
-        "Generate a complete, self-contained main file that "
-        "demonstrates all functions in this project.\n"
-        "- Include all necessary headers\n"
-        "- Create realistic example data\n"
-        "- Call each function and print results\n"
-        "- Show the full pipeline from data creation to final output\n"
-        "- Add clear comments explaining what each section demonstrates\n"
-        "- The main should compile and run without any modifications"
+        f"You are writing ONLY the main entry point for a {cfg['display']} project.\n"
+        f"The other source files already exist and are complete — DO NOT redefine or copy any function.\n"
+        f"\n"
+        f"CRITICAL RULES:\n"
+        f"- Your file must start with EXACTLY these imports (copy them verbatim):\n"
+        + "\n".join(f"  {l}" for l in import_lines) + "\n"
+        f"- After the imports, define only main() (or equivalent entry point)\n"
+        f"- NEVER redefine, copy, or re-implement any function from the existing files\n"
+        f"- Call each function with realistic example data and print the results\n"
+        f"- The file must compile and run alongside the existing source files without modifications\n"
     )
+
+    sources_section = (
+        "\n\nExisting source files (already compiled alongside main — use them, do not copy them):\n\n"
+        + "\n\n".join(existing_sources)
+    ) if existing_sources else ""
 
     user_content = (
         f"Project: {context.get('project', 'project')}\n"
-        f"Language: {cfg['display']}\n\n"
-        f"{project_desc}\n"
-        f"Generate a complete {cfg['display']} main file demonstrating all these functions."
+        f"Language: {cfg['display']}\n"
+        f"\nFunctions to demonstrate:\n" + "\n".join(fn_desc)
+        + sources_section
+        + f"\n\nWrite the {cfg['display']} main file. Start with the imports listed above."
     )
 
     messages = [

@@ -517,8 +517,7 @@ def render_menu(project_dir: Path) -> str:
     # Build menu line
     items = [("e", "new spec")]
     if has_context:
-        items += [("m", "modify"), ("b", "build"), ("p", "project"),
-                  ("g", "generate main"), ("x", "run main")]
+        items += [("m", "modify"), ("b", "build"), ("p", "project"), ("x", "run")]
     items += [("l", "language"), ("q", "quit")]
 
     menu_text = Text("  ")
@@ -549,8 +548,6 @@ def render_menu(project_dir: Path) -> str:
             return "project"
         if key in ("b", "B") and has_context:
             return "build"
-        if key in ("g", "G") and has_context:
-            return "generate_main"
         if key in ("x", "X") and has_context:
             return "run_main"
         if key in ("q", "Q", "\x03", "\x04"):  # q, Ctrl+C, Ctrl+D
@@ -1037,7 +1034,7 @@ def _action_run_main(context: dict, project_dir: Path, language: str) -> None:
 
     if not main_file.exists():
         console.print(f"  [yellow]No main file found ({main_file.relative_to(project_dir)})[/yellow]")
-        console.print("  [dim]Run [g] generate main first.[/dim]")
+        console.print("  [dim]Run [b] build first.[/dim]")
         return
 
     tmp_bin = "/tmp/speccode_main_bin"
@@ -1365,14 +1362,6 @@ def main():
                     console.print("  [yellow]No context found.[/yellow]")
                     continue
                 _action_build_menu(context, project_dir, CURRENT_LANGUAGE, stacked)
-                continue
-
-            if action == "generate_main":
-                context = load_context(project_dir)
-                if not context:
-                    console.print("  [yellow]No context found.[/yellow]")
-                    continue
-                _action_generate_main(context, project_dir, CURRENT_LANGUAGE)
                 continue
 
             if action == "run_main":

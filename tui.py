@@ -1083,6 +1083,9 @@ def main():
         while True:
             if next_action is None:
                 action = render_menu(project_dir)
+                if _menu_line_count > 0:
+                    sys.stdout.write(f"\x1b[{_menu_line_count}A\x1b[0J")
+                    sys.stdout.flush()
             else:
                 action, next_action = next_action, None
 
@@ -1091,18 +1094,12 @@ def main():
 
             if action == "language":
                 CURRENT_LANGUAGE = _prompt_language()
-                if _menu_line_count > 0:
-                    sys.stdout.write(f"\x1b[{_menu_line_count}A\x1b[0J")
-                    sys.stdout.flush()
                 continue
 
             if action == "modify":
                 context = load_context(project_dir)
                 if context:
                     _action_modify_spec(context, project_dir)
-                if _menu_line_count > 0:
-                    sys.stdout.write(f"\x1b[{_menu_line_count}A\x1b[0J")
-                    sys.stdout.flush()
                 continue
 
             if action == "project":
@@ -1172,9 +1169,6 @@ def main():
                 if not context:
                     console.print("  [yellow]No context found.[/yellow]")
                     continue
-                if _menu_line_count > 0:
-                    sys.stdout.write(f"\x1b[{_menu_line_count}A\x1b[0J")
-                    sys.stdout.flush()
                 _action_generate_main(context, project_dir, CURRENT_LANGUAGE)
                 continue
 
@@ -1183,9 +1177,6 @@ def main():
                 if not context:
                     console.print("  [yellow]No context found.[/yellow]")
                     continue
-                if _menu_line_count > 0:
-                    sys.stdout.write(f"\x1b[{_menu_line_count}A\x1b[0J")
-                    sys.stdout.flush()
                 _action_run_main(context, project_dir, CURRENT_LANGUAGE)
                 continue
 
@@ -1221,6 +1212,9 @@ def main():
                     errors = list(state.validation_errors)
 
                 action = render_menu(project_dir)
+                if _menu_line_count > 0:
+                    sys.stdout.write(f"\x1b[{_menu_line_count}A\x1b[0J")
+                    sys.stdout.flush()
                 if action == "edit":
                     _inject_errors_into_file(tmp_spec, content, errors)
                     next_action = "edit"
@@ -1239,6 +1233,9 @@ def main():
             has_validation_errors = False
             context = load_context(project_dir)
             next_action = render_menu(project_dir)
+            if _menu_line_count > 0:
+                sys.stdout.write(f"\x1b[{_menu_line_count}A\x1b[0J")
+                sys.stdout.flush()
 
     except KeyboardInterrupt:
         pass

@@ -829,6 +829,57 @@ def _action_generate_main(context: dict, project_dir: Path, language: str) -> No
 # Run main action
 # ---------------------------------------------------------------------------
 
+def _ocaml_topo_sort(files: list[Path]) -> list[Path]:
+    """
+    Return OCaml source files sorted so each file comes after its dependencies.
+    Dependency is detected via `open Modulename` statements.
+    Main is always placed last.
+    """
+    # OCaml module name: first char uppercased, rest unchanged
+    def mod_name(f: Path) -> str:
+        s = f.stem
+        return s[0].upper() + s[1:]
+
+    mod_to_file: dict[str, Path] = {mod_name(f): f for f in files}
+
+    # Build deps: stem -> list of stems this file opens
+    deps: dict[str, list[str]] = {f.stem: [] for f in files}
+    for f in files:
+        try:
+            content = f.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for opened in re.findall(r"^open\s+(\w+)", content, re.MULTILINE):
+            dep = mod_to_file.get(opened)
+            if dep and dep.stem != f.stem:
+                deps[f.stem].append(dep.stem)
+
+    ordered: list[Path] = []
+    visited: set[str] = set()
+    in_progress: set[str] = set()
+
+    def visit(stem: str) -> None:
+        if stem in visited or stem in in_progress:
+            return
+        in_progress.add(stem)
+        for dep in deps.get(stem, []):
+            visit(dep)
+        in_progress.discard(stem)
+        visited.add(stem)
+        for f in files:
+            if f.stem == stem:
+                ordered.append(f)
+                break
+
+    for f in files:
+        visit(f.stem)
+
+    # Guarantee main is last regardless of open statements
+    non_main = [f for f in ordered if f.stem != "main"]
+    main_files = [f for f in ordered if f.stem == "main"]
+    return non_main + main_files
+
+
 def _action_run_main(context: dict, project_dir: Path, language: str) -> None:
     """Compile (if needed) and run src/main.{ext}, display output or error."""
     cfg = LANGUAGE_CONFIGS.get(language, LANGUAGE_CONFIGS["c++"])
@@ -903,9 +954,7 @@ def _action_run_main(context: dict, project_dir: Path, language: str) -> None:
 
         elif language == "ocaml":
             ml_files = sorted(src_dir.glob("*.ml"))
-            non_main = [f for f in ml_files if f.name != f"main{ext}"]
-            main_ml = [f for f in ml_files if f.name == f"main{ext}"]
-            ordered = non_main + main_ml
+            ordered = _ocaml_topo_sort(ml_files)
             compile_result = subprocess.run(
                 ["ocamlopt"] + [str(f) for f in ordered] + ["-o", tmp_bin],
                 capture_output=True, text=True, cwd=str(project_dir),

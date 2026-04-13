@@ -843,6 +843,21 @@ def _action_run_main(context: dict, project_dir: Path, language: str) -> None:
 
     tmp_bin = "/tmp/speccode_main_bin"
 
+    # Map language → (required binary, install hint)
+    _REQUIRED = {
+        "c++":        ("g++",      "brew install gcc"),
+        "python":     ("python3",  "brew install python"),
+        "rust":       ("rustc",    "curl https://sh.rustup.rs -sSf | sh"),
+        "go":         ("go",       "brew install go"),
+        "ocaml":      ("ocamlopt", "brew install ocaml"),
+        "typescript": ("npx",      "brew install node"),
+    }
+    if language in _REQUIRED:
+        binary, hint = _REQUIRED[language]
+        if not shutil.which(binary):
+            console.print(f"  [red]{binary} not found.[/red]  [dim]Install with: {hint}[/dim]")
+            return
+
     try:
         if language == "c++":
             cpp_files = sorted(src_dir.glob("*.cpp"))

@@ -5,7 +5,6 @@ Terminal interface for the speccode pipeline.
 
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 import select
@@ -41,6 +40,8 @@ from orchestrator import (
     parse_spec,
     run_pipeline,
     save_context,
+    save_spec,
+    topo_sort_specs,
 )
 
 console = Console()
@@ -516,7 +517,7 @@ def render_menu(project_dir: Path) -> str:
     # Build menu line
     items = [("e", "new spec")]
     if has_context:
-        items += [("m", "modify"), ("r", "rebuild"), ("p", "project"),
+        items += [("m", "modify"), ("b", "build"), ("p", "project"),
                   ("g", "generate main"), ("x", "run main")]
     items += [("l", "language"), ("q", "quit")]
 
@@ -546,8 +547,8 @@ def render_menu(project_dir: Path) -> str:
             return "language"
         if key in ("p", "P") and has_context:
             return "project"
-        if key in ("r", "R") and has_context:
-            return "rebuild"
+        if key in ("b", "B") and has_context:
+            return "build"
         if key in ("g", "G") and has_context:
             return "generate_main"
         if key in ("x", "X") and has_context:
@@ -743,18 +744,10 @@ def _action_modify_spec(context: dict, project_dir: Path) -> None:
         return
 
     new_content = spec_path.read_text(encoding="utf-8")
-    new_hash = hashlib.sha256(new_content.encode()).hexdigest()[:8]
+    language = context.get("language", "c++")
+    save_spec(new_content, project_dir, language)
 
-    ctx = load_context(project_dir)
-    if ctx:
-        for fn in ctx.get("functions", []):
-            if fn["name"] == entries[idx]["name"]:
-                fn["spec_hash"] = new_hash
-                fn["stale"] = True
-                break
-        save_context(project_dir, ctx)
-
-    console.print("  [green]✓ spec updated — run [r] to rebuild[/green]")
+    console.print("  [green]✓ spec updated — run [b] to build[/green]")
     time.sleep(1.5)
 
 
@@ -1225,7 +1218,7 @@ def main():
                         lines.append("  [green]SPECS.md up to date[/green]")
                     else:
                         lines.append("")
-                        lines.append("  [yellow]SPECS.md missing — regenerate with [r][/yellow]")
+                        lines.append("  [yellow]SPECS.md missing — run [b] to build[/yellow]")
                     from rich.panel import Panel as _Panel
                     console.print(_Panel(
                         "\n".join(lines),
@@ -1234,26 +1227,34 @@ def main():
                     ))
                 continue
 
-            if action == "rebuild":
+            if action == "build":
                 context = load_context(project_dir)
                 if not context:
                     console.print("  [yellow]No context found.[/yellow]")
                     continue
-                functions = context.get("functions", [])
-                console.print(f"  [rgb(100,140,180)]Rebuilding {len(functions)} function(s)...[/rgb(100,140,180)]")
-                for fn in functions:
+                ordered = topo_sort_specs(context)
+                if not ordered:
+                    console.print("  [yellow]No specs to build.[/yellow]")
+                    continue
+                console.print(f"  [rgb(100,140,180)]Building {len(ordered)} spec(s)...[/rgb(100,140,180)]")
+                for fn in ordered:
                     fn_name = fn["name"]
                     spec_path = project_dir / fn.get("spec_file", f"specs/{fn_name}.lean")
                     if not spec_path.exists():
                         console.print(f"  [yellow]skip {fn_name}: spec not found[/yellow]")
                         continue
                     console.print(f"  [dim]→ {fn_name}[/dim]")
-                    spec_content = spec_path.read_text(encoding="utf-8")
+                    spec_text = spec_path.read_text(encoding="utf-8")
                     state = DisplayState()
-                    validate_and_generate(spec_content, state, stacked, CURRENT_LANGUAGE)
+                    validate_and_generate(spec_text, state, stacked, CURRENT_LANGUAGE)
+                # Generate main after all specs
                 context = load_context(project_dir)
-                emit_ctx = {"fn_count": len(context.get("functions", [])) if context else 0}
-                console.print(f"  [green]✓ rebuild done — {emit_ctx['fn_count']} function(s)[/green]")
+                if context and any(f.get("kind") != "demo" for f in context.get("functions", [])):
+                    console.print("  [dim]→ main[/dim]")
+                    _action_generate_main(context, project_dir, CURRENT_LANGUAGE)
+                context = load_context(project_dir)
+                fn_count = len([f for f in context.get("functions", []) if f.get("kind") != "demo"]) if context else 0
+                console.print(f"  [green]✓ build done — {fn_count} spec(s) + main[/green]")
                 continue
 
             if action == "generate_main":
@@ -1275,59 +1276,64 @@ def main():
             # action == "edit"
             tmp_spec = Path("/tmp/speccode_input.lean")
 
-            # A. Prepare the temp file: empty for new specs,
-            #    or keep as-is (errors already injected) for validation retries.
+            # A. Prepare temp file (empty for new spec, keep errors for retry)
             if not has_validation_errors:
                 tmp_spec.write_text("", encoding="utf-8")
 
-            # Open editor, read raw content
             raw = run_once()
             if raw is None:
                 has_validation_errors = False
-                continue  # editor not found — back to menu
+                continue
 
-            # B. Strip header comments; if nothing remains, back to menu
-            content = _strip_error_header(raw)
-            if not content.strip():
+            spec_input = _strip_error_header(raw)
+            if not spec_input.strip():
                 has_validation_errors = False
                 console.print("[yellow]No input.[/yellow]")
                 continue
 
-            # C/D. Show spec with "validating..." then validate and optionally generate
-            state = DisplayState()
-            result = validate_and_generate(content, state, stacked, CURRENT_LANGUAGE)
+            # B. Validate (pure Python, no AI)
+            valid, errors = validate_lean_spec(spec_input)
 
-            # E. Invalid — show full menu; inject errors if user chooses to edit
-            if result == "invalid":
+            if not valid:
                 has_validation_errors = True
-                with state._lock:
-                    errors = list(state.validation_errors)
+                from rich.console import Group as _Group
+                spec_display = Syntax(spec_input, "text", theme="monokai",
+                                      word_wrap=True, background_color="default")
+                err_text = Text("\n")
+                for e in errors:
+                    err_text.append(f"  ✗ {e}\n", style="bright_red")
+                console.print(Panel(_Group(spec_display, err_text),
+                                    title="[bright_red]invalid spec[/bright_red]",
+                                    border_style="bright_red"))
 
                 action = render_menu(project_dir)
                 if _menu_line_count > 0:
                     sys.stdout.write(f"\x1b[{_menu_line_count}A\x1b[0J")
                     sys.stdout.flush()
                 if action == "edit":
-                    _inject_errors_into_file(tmp_spec, content, errors)
+                    _inject_errors_into_file(tmp_spec, spec_input, errors)
                     next_action = "edit"
                 elif action == "language":
                     CURRENT_LANGUAGE = _prompt_language()
-                    _inject_errors_into_file(tmp_spec, content, errors)
+                    _inject_errors_into_file(tmp_spec, spec_input, errors)
                     next_action = "edit"
                 elif action == "quit":
                     has_validation_errors = False
                     next_action = "quit"
                 else:
-                    next_action = action  # project or rebuild — pass through
+                    next_action = action
                 continue
 
-            # F. Valid — pipeline ran (done or error); show full menu
+            # C. Valid — save spec, parse depends, update context (no code generation)
             has_validation_errors = False
-            context = load_context(project_dir)
-            next_action = render_menu(project_dir)
-            if _menu_line_count > 0:
-                sys.stdout.write(f"\x1b[{_menu_line_count}A\x1b[0J")
-                sys.stdout.flush()
+            fn_name, context = save_spec(spec_input, project_dir, CURRENT_LANGUAGE)
+
+            console.print(Panel(
+                Syntax(spec_input, "text", theme="monokai",
+                       word_wrap=True, background_color="default"),
+                title=f"[bright_green]spec saved → specs/{fn_name}.lean[/bright_green]",
+                border_style="bright_green",
+            ))
 
     except KeyboardInterrupt:
         pass

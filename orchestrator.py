@@ -658,6 +658,105 @@ def init_context(project_dir: Path, language: str) -> dict:
     }
 
 
+def parse_depends(spec_content: str) -> list[str]:
+    """Return the list of names declared in '-- depends: a, b' comments."""
+    deps: list[str] = []
+    for m in re.finditer(r"--\s*depends:\s*(.+)", spec_content):
+        deps.extend(d.strip() for d in m.group(1).split(",") if d.strip())
+    return deps
+
+
+def save_spec(
+    spec_content: str,
+    project_dir: Path,
+    language: str,
+) -> tuple[str, dict]:
+    """
+    Save a spec file without generating code.
+    Deterministically parses -- depends:, updates context and SPECS.md.
+    Returns (fn_name, updated_context).
+    """
+    kind = detect_spec_kind(spec_content)
+    fn_name = detect_type_name(spec_content) if kind == "type" else detect_function_name(spec_content)
+
+    depends_on = parse_depends(spec_content)
+    theorems = re.findall(r"^(?:theorem|lemma)\s+(\w+)", spec_content, re.MULTILINE)
+    fields = extract_type_fields(spec_content) if kind == "type" else []
+    spec_hash = hashlib.sha256(spec_content.encode()).hexdigest()[:8]
+
+    specs_dir = project_dir / "specs"
+    specs_dir.mkdir(exist_ok=True)
+    (specs_dir / f"{fn_name}.lean").write_text(spec_content, encoding="utf-8")
+
+    context = load_context(project_dir)
+    if context is None:
+        context = init_context(project_dir, language)
+
+    cfg = LANGUAGE_CONFIGS.get(language, LANGUAGE_CONFIGS["c++"])
+    existing = next((f for f in context.get("functions", []) if f["name"] == fn_name), None)
+
+    entry: dict = {
+        "name": fn_name,
+        "kind": kind,
+        "spec_file": f"specs/{fn_name}.lean",
+        "spec_hash": spec_hash,
+        "depends_on": depends_on,
+        "theorems": theorems,
+        "fields": fields,
+        "stale": True,
+        # Preserve code fields if already generated, else empty
+        "code_file": existing.get("code_file", f"src/{fn_name}{cfg['ext']}") if existing else f"src/{fn_name}{cfg['ext']}",
+        "signature": existing.get("signature", "") if existing else "",
+        "generated_at": existing.get("generated_at", "") if existing else "",
+        "language": language,
+    }
+
+    fns = context.get("functions", [])
+    for i, fn in enumerate(fns):
+        if fn["name"] == fn_name:
+            fns[i] = entry
+            break
+    else:
+        fns.append(entry)
+    context["functions"] = fns
+    save_context(project_dir, context)
+
+    specs_md = generate_specs_md(context, project_dir)
+    (project_dir / "SPECS.md").write_text(specs_md, encoding="utf-8")
+
+    return fn_name, context
+
+
+def topo_sort_specs(context: dict) -> list[dict]:
+    """
+    Return non-demo function entries sorted so every dependency comes
+    before the entries that depend on it.
+    """
+    entries = [f for f in context.get("functions", []) if f.get("kind") != "demo"]
+    name_to_entry = {e["name"]: e for e in entries}
+
+    ordered: list[dict] = []
+    visited: set[str] = set()
+    in_progress: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in visited or name not in name_to_entry:
+            return
+        if name in in_progress:
+            return  # cycle — skip
+        in_progress.add(name)
+        for dep in name_to_entry[name].get("depends_on", []):
+            visit(dep)
+        in_progress.discard(name)
+        visited.add(name)
+        ordered.append(name_to_entry[name])
+
+    for e in entries:
+        visit(e["name"])
+
+    return ordered
+
+
 def update_context_entry(
     context: dict,
     fn_name: str,
@@ -673,11 +772,7 @@ def update_context_entry(
     """Add or update an entry in context['functions']."""
     spec_hash = hashlib.sha256(spec_content.encode()).hexdigest()[:8]
 
-    # Parse "-- depends: funcA, funcB" comments
-    depends_on: list[str] = []
-    for m in re.finditer(r"--\s*depends:\s*(.+)", spec_content):
-        deps = [d.strip() for d in m.group(1).split(",") if d.strip()]
-        depends_on.extend(deps)
+    depends_on = parse_depends(spec_content)
 
     generated_at = datetime.datetime.now().isoformat(timespec="seconds")
 

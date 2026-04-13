@@ -27,9 +27,11 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 from orchestrator import (
+    LANGUAGE_CONFIGS,
     check_stale,
     clean_lean_error,
     count_blocks,
+    generate_main,
     generate_specs_md,
     init_context,
     load_api_key,
@@ -512,7 +514,8 @@ def render_menu(project_dir: Path) -> str:
     # Build menu line
     items = [("e", "new spec")]
     if has_context:
-        items += [("m", "modify"), ("r", "rebuild"), ("p", "project")]
+        items += [("m", "modify"), ("r", "rebuild"), ("p", "project"),
+                  ("g", "generate main"), ("x", "run main")]
     items += [("l", "language"), ("q", "quit")]
 
     menu_text = Text("  ")
@@ -543,6 +546,10 @@ def render_menu(project_dir: Path) -> str:
             return "project"
         if key in ("r", "R") and has_context:
             return "rebuild"
+        if key in ("g", "G") and has_context:
+            return "generate_main"
+        if key in ("x", "X") and has_context:
+            return "run_main"
         if key in ("q", "Q", "\x03", "\x04"):  # q, Ctrl+C, Ctrl+D
             return "quit"
         # unknown key: wait for next
@@ -747,6 +754,179 @@ def _action_modify_spec(context: dict, project_dir: Path) -> None:
 
     console.print("  [green]✓ spec updated — run [r] to rebuild[/green]")
     time.sleep(1.5)
+
+
+# ---------------------------------------------------------------------------
+# Generate main action
+# ---------------------------------------------------------------------------
+
+def _action_generate_main(context: dict, project_dir: Path, language: str) -> None:
+    """Stream-generate src/main.{ext} and display in a live panel."""
+    cfg = LANGUAGE_CONFIGS.get(language, LANGUAGE_CONFIGS["c++"])
+    lang_fence = LANG_FENCE.get(language, "cpp")
+    ext = cfg["ext"]
+
+    buf: list[str] = []
+    done_event = threading.Event()
+    error_holder: list[str] = []
+    start = time.time()
+
+    def on_chunk(chunk: str):
+        buf.append(chunk)
+
+    def _run():
+        try:
+            generate_main(context, project_dir, language, on_chunk=on_chunk)
+        except Exception as exc:
+            error_holder.append(str(exc))
+        finally:
+            done_event.set()
+
+    class _Render:
+        def __rich_console__(self, c, opts):
+            code = "".join(buf)
+            elapsed = time.time() - start
+            if error_holder:
+                msg = Text()
+                msg.append("✗ ", style="bright_red bold")
+                msg.append(error_holder[0], style="red")
+                yield Panel(msg, title="[bright_red]error[/bright_red]", border_style="bright_red")
+                return
+            is_done = done_event.is_set()
+            header = Text()
+            if is_done:
+                header.append("✓ ", style="green bold")
+                header.append(f"src/main{ext} saved  │  {elapsed:.1f}s\n\n", style="dim")
+            else:
+                header.append(f"{_sp()} ", style="rgb(100,140,180)")
+                header.append("Generating main…", style="rgb(100,140,180) bold")
+                header.append(f"  [{elapsed:.1f}s]\n\n", style="dim")
+            if code.strip():
+                try:
+                    from rich.console import Group
+                    yield Panel(
+                        Group(header, Syntax(code, lang_fence, theme="monokai",
+                                             word_wrap=True, background_color="default")),
+                        title="[bright_green]main[/bright_green]" if is_done else "[rgb(100,140,180)]main[/rgb(100,140,180)]",
+                        border_style="bright_green" if is_done else "rgb(100,140,180)",
+                    )
+                except Exception:
+                    header.append(code)
+                    yield Panel(header, title="main", border_style="dim")
+            else:
+                yield Panel(header, title="main", border_style="dim")
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+    with Live(_Render(), console=console, refresh_per_second=15, transient=False):
+        done_event.wait()
+
+    t.join()
+
+
+# ---------------------------------------------------------------------------
+# Run main action
+# ---------------------------------------------------------------------------
+
+def _action_run_main(context: dict, project_dir: Path, language: str) -> None:
+    """Compile (if needed) and run src/main.{ext}, display output or error."""
+    cfg = LANGUAGE_CONFIGS.get(language, LANGUAGE_CONFIGS["c++"])
+    ext = cfg["ext"]
+    src_dir = project_dir / "src"
+    main_file = src_dir / f"main{ext}"
+
+    if not main_file.exists():
+        console.print(f"  [yellow]No main file found ({main_file.relative_to(project_dir)})[/yellow]")
+        console.print("  [dim]Run [g] generate main first.[/dim]")
+        return
+
+    tmp_bin = "/tmp/speccode_main_bin"
+
+    try:
+        if language == "c++":
+            cpp_files = sorted(src_dir.glob("*.cpp"))
+            if not cpp_files:
+                console.print("  [red]No .cpp files found in src/[/red]")
+                return
+            compile_result = subprocess.run(
+                ["g++", "-std=c++17", f"-I{src_dir}"] + [str(f) for f in cpp_files] + ["-o", tmp_bin],
+                capture_output=True, text=True, cwd=str(project_dir),
+            )
+            if compile_result.returncode != 0:
+                err = compile_result.stderr or compile_result.stdout or "(no output)"
+                console.print(Panel(err.strip(), title="[bright_red]compile error[/bright_red]",
+                                    border_style="bright_red"))
+                return
+            run_result = subprocess.run([tmp_bin], capture_output=True, text=True, timeout=30)
+
+        elif language == "python":
+            run_result = subprocess.run(
+                ["python3", str(main_file)],
+                capture_output=True, text=True, cwd=str(project_dir), timeout=30,
+            )
+
+        elif language == "rust":
+            rs_files = sorted(src_dir.glob("*.rs"))
+            compile_result = subprocess.run(
+                ["rustc"] + [str(f) for f in rs_files] + ["-o", tmp_bin],
+                capture_output=True, text=True, cwd=str(project_dir),
+            )
+            if compile_result.returncode != 0:
+                err = compile_result.stderr or compile_result.stdout or "(no output)"
+                console.print(Panel(err.strip(), title="[bright_red]compile error[/bright_red]",
+                                    border_style="bright_red"))
+                return
+            run_result = subprocess.run([tmp_bin], capture_output=True, text=True, timeout=30)
+
+        elif language == "go":
+            go_files = sorted(src_dir.glob("*.go"))
+            run_result = subprocess.run(
+                ["go", "run"] + [str(f) for f in go_files],
+                capture_output=True, text=True, cwd=str(project_dir), timeout=30,
+            )
+
+        elif language == "ocaml":
+            ml_files = sorted(src_dir.glob("*.ml"))
+            non_main = [f for f in ml_files if f.name != f"main{ext}"]
+            main_ml = [f for f in ml_files if f.name == f"main{ext}"]
+            ordered = non_main + main_ml
+            compile_result = subprocess.run(
+                ["ocamlopt"] + [str(f) for f in ordered] + ["-o", tmp_bin],
+                capture_output=True, text=True, cwd=str(project_dir),
+            )
+            if compile_result.returncode != 0:
+                err = compile_result.stderr or compile_result.stdout or "(no output)"
+                console.print(Panel(err.strip(), title="[bright_red]compile error[/bright_red]",
+                                    border_style="bright_red"))
+                return
+            run_result = subprocess.run([tmp_bin], capture_output=True, text=True, timeout=30)
+
+        elif language == "typescript":
+            run_result = subprocess.run(
+                ["npx", "ts-node", str(main_file)],
+                capture_output=True, text=True, cwd=str(project_dir), timeout=60,
+            )
+
+        else:
+            console.print(f"  [yellow]Run not supported for language: {language}[/yellow]")
+            return
+
+        if run_result.returncode == 0:
+            output = run_result.stdout or "(no output)"
+            console.print(Panel(output.strip(), title="[bright_green]output[/bright_green]",
+                                border_style="bright_green"))
+        else:
+            err = run_result.stderr or run_result.stdout or "(no output)"
+            console.print(Panel(err.strip(), title="[bright_red]runtime error[/bright_red]",
+                                border_style="bright_red"))
+
+    except subprocess.TimeoutExpired:
+        console.print("  [red]Timeout: execution exceeded time limit.[/red]")
+    except FileNotFoundError as exc:
+        console.print(f"  [red]Command not found: {exc.filename}[/red]")
+    except Exception as exc:
+        console.print(f"  [red]Error: {exc}[/red]")
 
 
 # ---------------------------------------------------------------------------
@@ -985,6 +1165,28 @@ def main():
                 context = load_context(project_dir)
                 emit_ctx = {"fn_count": len(context.get("functions", [])) if context else 0}
                 console.print(f"  [green]✓ rebuild done — {emit_ctx['fn_count']} function(s)[/green]")
+                continue
+
+            if action == "generate_main":
+                context = load_context(project_dir)
+                if not context:
+                    console.print("  [yellow]No context found.[/yellow]")
+                    continue
+                if _menu_line_count > 0:
+                    sys.stdout.write(f"\x1b[{_menu_line_count}A\x1b[0J")
+                    sys.stdout.flush()
+                _action_generate_main(context, project_dir, CURRENT_LANGUAGE)
+                continue
+
+            if action == "run_main":
+                context = load_context(project_dir)
+                if not context:
+                    console.print("  [yellow]No context found.[/yellow]")
+                    continue
+                if _menu_line_count > 0:
+                    sys.stdout.write(f"\x1b[{_menu_line_count}A\x1b[0J")
+                    sys.stdout.flush()
+                _action_run_main(context, project_dir, CURRENT_LANGUAGE)
                 continue
 
             # action == "edit"

@@ -55,6 +55,12 @@ theorem insertionSort_perm (l : List Int) :
 
 Get back verified C++ (or Python, Rust, OCaml, Go, TypeScript).
 
+### Demo
+
+| Generating | Result |
+|:---:|:---:|
+| ![Codestral generating from a Lean spec](img_readme/generating.png) | ![Generated C++ code](img_readme/result.png) |
+
 ### Multi-function project with dependencies
 
 Once `myInsert` exists in your project, write a spec that declares its dependency:
@@ -199,6 +205,7 @@ corresponding include or import directives. The generated code can call them dir
 | 4   | OCaml (functional) | `.ml` |
 | 5   | Go 1.21+ | `.go` |
 | 6   | TypeScript (strict) | `.ts` |
+| 7   | Lean 4 (sorry-filling) | `.lean` |
 
 ## Requirements
 
@@ -216,6 +223,7 @@ corresponding include or import directives. The generated code can call them dir
 - [x] Automatic `SPECS.md` documentation
 - [x] Stale detection and rebuild
 - [x] Lean spec validation before generation
+- [x] Lean 4 as build target — sorry-filling with deterministic non-sorry preservation
 - [ ] Tier 1 — automated proof tactics (`aesop`, `omega`, `simp_all`)
 - [ ] Tier 2 — LeanDojo interactive proof search
 - [ ] Tier 3 — LLM + Mathlib RAG for complex proofs

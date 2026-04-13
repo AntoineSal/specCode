@@ -103,6 +103,18 @@ LANGUAGE_CONFIGS = {
         "fence": "typescript",
         "ext": ".ts",
     },
+    "lean": {
+        "display": "Lean 4",
+        "system_rules": (
+            "Write correct Lean 4 code using standard tactics and definitions\n"
+            "- Use omega, simp, ring, induction, cases, exact, rfl, decide as appropriate\n"
+            "- Prefer tactic proofs with `by` for theorems\n"
+            "- No sorry in the output"
+        ),
+        "section": "Lean 4 Implementation",
+        "fence": "lean",
+        "ext": ".lean",
+    },
 }
 
 
@@ -1018,6 +1030,166 @@ def compute_cost(token_usage: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Lean sorry-filling
+# ---------------------------------------------------------------------------
+
+_TOP_LEVEL_RE = re.compile(
+    r"^(?:noncomputable\s+)?(?:def|theorem|lemma|structure|inductive|abbrev|class)\s+(\w+)",
+    re.MULTILINE,
+)
+
+
+def _parse_lean_blocks(spec_content: str) -> tuple[str, list[dict]]:
+    """
+    Split a Lean 4 spec into (header, blocks).
+    header — everything before the first top-level declaration.
+    Each block dict: {keyword, name, content, is_sorry}.
+    """
+    lines = spec_content.splitlines(keepends=True)
+
+    positions: list[tuple[int, str, str]] = []  # (line_no, keyword, name)
+    for m in _TOP_LEVEL_RE.finditer(spec_content):
+        line_no = spec_content[: m.start()].count("\n")
+        kw = m.group(0).split()[0] if m.group(0).split()[0] != "noncomputable" else m.group(0).split()[1]
+        positions.append((line_no, kw, m.group(1)))
+
+    if not positions:
+        return spec_content, []
+
+    first_line = positions[0][0]
+    header = "".join(lines[:first_line])
+
+    blocks: list[dict] = []
+    for i, (line_no, keyword, name) in enumerate(positions):
+        end_line = positions[i + 1][0] if i + 1 < len(positions) else len(lines)
+        content = "".join(lines[line_no:end_line])
+        is_sorry = bool(re.search(r":=\s*by\s+sorry|:=\s*sorry|\bsorry\b", content))
+        blocks.append({"keyword": keyword, "name": name, "content": content, "is_sorry": is_sorry})
+
+    return header, blocks
+
+
+def generate_lean_impl(
+    spec_content: str,
+    project_dir: Path,
+    fn_name: str,
+    on_chunk=None,
+    on_retry=None,
+    token_usage: dict | None = None,
+) -> str:
+    """
+    Fill sorry blocks in spec_content via LLM.
+    Non-sorry blocks are preserved bit-for-bit (deterministic guarantee).
+    Returns the completed Lean 4 source to write to src/{fn_name}.lean.
+    """
+    if token_usage is None:
+        token_usage = {"codestral_input": 0, "codestral_output": 0}
+
+    header, blocks = _parse_lean_blocks(spec_content)
+
+    sorry_blocks = [b for b in blocks if b["is_sorry"]]
+    non_sorry_by_name = {b["name"]: b["content"] for b in blocks if not b["is_sorry"]}
+
+    if not sorry_blocks:
+        return spec_content  # nothing to fill
+
+    sorry_stubs = "\n".join(b["content"].rstrip() for b in sorry_blocks)
+
+    # Give full spec as read-only context so the LLM understands dependencies
+    non_sorry_section = ""
+    if non_sorry_by_name:
+        non_sorry_section = (
+            "Full spec context (already implemented — do NOT repeat in your output):\n"
+            f"```lean\n{spec_content}\n```\n\n"
+        )
+
+    system_prompt = (
+        "You are an expert Lean 4 mathematician and programmer.\n"
+        "Complete the given Lean 4 stubs by replacing every `sorry` with a correct "
+        "implementation or proof.\n"
+        "\n"
+        "Rules:\n"
+        "- Fill ONLY the stubs listed under 'Complete these stubs'\n"
+        "- Use standard Lean 4 tactics: omega, simp, ring, norm_num, decide, "
+        "induction, cases, exact, rfl, constructor, apply, intro, …\n"
+        "- For `def` stubs: provide a correct functional implementation\n"
+        "- For `theorem`/`lemma` stubs: provide a valid proof\n"
+        "- Do NOT change type signatures, names, or imports\n"
+        "- Do NOT include already-complete definitions in your output\n"
+        "- No sorry in the output\n"
+        "\n"
+        "Output format: one ```lean block containing ONLY the completed stubs, nothing else."
+    )
+
+    user_content = (
+        f"{non_sorry_section}"
+        f"Complete these stubs (replace sorry):\n"
+        f"```lean\n{sorry_stubs}\n```"
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+
+    client = get_client()
+    accumulated: list[str] = []
+
+    def _call():
+        accumulated.clear()
+        stream = client.chat.stream(
+            model=CODESTRAL_MODEL,
+            messages=messages,
+            timeout_ms=API_TIMEOUT * 1000,
+        )
+        for event in stream:
+            chunk = event.data
+            if chunk.choices:
+                delta = chunk.choices[0].delta.content or ""
+                if delta:
+                    accumulated.append(delta)
+                    if on_chunk:
+                        on_chunk(delta)
+            if chunk.usage:
+                token_usage["codestral_input"] += chunk.usage.prompt_tokens or 0
+                token_usage["codestral_output"] += chunk.usage.completion_tokens or 0
+
+    api_call_with_retry(_call, on_retry=on_retry)
+    raw = "".join(accumulated)
+
+    # Parse the completed output into blocks indexed by name
+    completed_stubs = extract_lean_block(raw)
+    if not completed_stubs:
+        completed_stubs = sorry_stubs  # fallback: keep original stubs
+
+    completed_lines = completed_stubs.splitlines(keepends=True)
+    c_positions: list[tuple[int, str]] = []
+    for m in _TOP_LEVEL_RE.finditer(completed_stubs):
+        line_no = completed_stubs[: m.start()].count("\n")
+        c_positions.append((line_no, m.group(1)))
+
+    completed_by_name: dict[str, str] = {}
+    for i, (line_no, name) in enumerate(c_positions):
+        end_line = c_positions[i + 1][0] if i + 1 < len(c_positions) else len(completed_lines)
+        completed_by_name[name] = "".join(completed_lines[line_no:end_line])
+
+    # Reconstruct: header + blocks in spec order
+    # Non-sorry blocks are ALWAYS taken verbatim from the original spec
+    parts: list[str] = []
+    if header.strip():
+        parts.append(header.rstrip())
+    for b in blocks:
+        name = b["name"]
+        if b["is_sorry"] and name in completed_by_name:
+            parts.append(completed_by_name[name].rstrip())
+        else:
+            # Deterministic: copy from spec, not from LLM output
+            parts.append(non_sorry_by_name.get(name, b["content"]).rstrip())
+
+    return "\n\n".join(parts) + "\n"
+
+
+# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
@@ -1060,8 +1232,8 @@ def run_pipeline(
     )
     emit("spec_parsed", {"fn_count": fn_count, "thm_count": thm_count, "kind": kind})
 
-    # Step 2: Generate
-    emit("generating", {})
+    theorems = re.findall(r"^(?:theorem|lemma)\s+(\w+)", spec_content, re.MULTILINE)
+    fields = extract_type_fields(spec_content) if kind == "type" else []
 
     def on_chunk(chunk: str):
         emit("streaming", {"chunk": chunk})
@@ -1069,6 +1241,66 @@ def run_pipeline(
     def on_retry(status, wait, attempt, max_retries):
         emit("api_retry", {"status": status, "wait": wait,
                            "attempt": attempt, "max_retries": max_retries})
+
+    # ── Lean path: fill sorry blocks instead of translating ──────────────────
+    if target_language == "lean":
+        emit("generating", {})
+        try:
+            lean_code = generate_lean_impl(
+                spec_content, project_dir, fn_name,
+                on_chunk=on_chunk, on_retry=on_retry,
+                token_usage=token_usage,
+            )
+        except Exception as e:
+            emit("error", {"message": str(e)})
+            return {"success": False, "error": str(e)}
+
+        src_dir = project_dir / "src"
+        src_dir.mkdir(exist_ok=True)
+        specs_dir = project_dir / "specs"
+        specs_dir.mkdir(exist_ok=True)
+        (specs_dir / f"{fn_name}.lean").write_text(spec_content, encoding="utf-8")
+        lean_src = src_dir / f"{fn_name}.lean"
+        if lean_src.exists():
+            lean_src.unlink()
+        lean_src.write_text(lean_code, encoding="utf-8")
+
+        cost = compute_cost(token_usage)
+        spec_file = f"specs/{fn_name}.lean"
+        code_file = f"src/{fn_name}.lean"
+        context = update_context_entry(
+            context,
+            fn_name=fn_name,
+            spec_file=spec_file,
+            spec_content=spec_content,
+            code_file=code_file,
+            signature="",
+            language="lean",
+            theorems=theorems,
+            kind=kind,
+            fields=fields,
+        )
+        save_context(project_dir, context)
+        specs_md = generate_specs_md(context, project_dir)
+        (project_dir / "SPECS.md").write_text(specs_md, encoding="utf-8")
+        emit("context_updated", {"fn_count": len(context["functions"])})
+        emit("done", {
+            "code": lean_code,
+            "output_dir": str(project_dir),
+            "src_file": str(lean_src),
+            "spec_file": str(specs_dir / f"{fn_name}.lean"),
+            "cost": cost,
+            "fn_name": fn_name,
+            "lang": "lean",
+            "lang_ext": ".lean",
+            "lang_fence": "lean",
+        })
+        return {"success": True, "code": lean_code, "output_dir": str(project_dir),
+                "cost": cost, "token_usage": token_usage}
+
+    # ── Standard path: translate to target language ───────────────────────────
+    # Step 2: Generate
+    emit("generating", {})
 
     try:
         client = get_client()
@@ -1091,8 +1323,6 @@ def run_pipeline(
     spec_file = f"specs/{fn_name}.lean"
     code_file = f"src/{fn_name}.hpp" if kind == "type" else f"src/{fn_name}{cfg['ext']}"
     signature = "" if kind == "type" else extract_signature(code, target_language)
-    theorems = re.findall(r"^(?:theorem|lemma)\s+(\w+)", spec_content, re.MULTILINE)
-    fields = extract_type_fields(spec_content) if kind == "type" else []
     context = update_context_entry(
         context,
         fn_name=fn_name,

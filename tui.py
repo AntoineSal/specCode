@@ -58,6 +58,7 @@ LANG_FENCE: dict[str, str] = {
     "ocaml": "ocaml",
     "go": "go",
     "typescript": "typescript",
+    "lean": "lean",
 }
 
 
@@ -564,6 +565,7 @@ def _prompt_language() -> str:
         ("4", "ocaml"),
         ("5", "go"),
         ("6", "typescript"),
+        ("7", "lean"),
     ]
     current = CURRENT_LANGUAGE
     idx = next((i for i, (_, l) in enumerate(lang_entries) if l == current), 0)
@@ -771,10 +773,11 @@ def _action_build_menu(context: dict, project_dir: Path, language: str, stacked:
     spec_entries = [e for e in context.get("functions", []) if e.get("kind") != "demo"]
 
     # All navigable items: specs + separator-specials
-    items: list[dict] = spec_entries + [
-        {"name": _GEN_MAIN,  "_label": "generate main"},
-        {"name": _BUILD_ALL, "_label": "build all"},
-    ]
+    specials: list[dict] = []
+    if language != "lean":
+        specials.append({"name": _GEN_MAIN, "_label": "generate main"})
+    specials.append({"name": _BUILD_ALL, "_label": "build all"})
+    items: list[dict] = spec_entries + specials
 
     idx = 0
 
@@ -858,7 +861,7 @@ def _action_build_menu(context: dict, project_dir: Path, language: str, stacked:
             state = DisplayState()
             validate_and_generate(spec_path.read_text(encoding="utf-8"), state, stacked, language)
         ctx = load_context(project_dir)
-        if ctx and any(f.get("kind") != "demo" for f in ctx.get("functions", [])):
+        if language != "lean" and ctx and any(f.get("kind") != "demo" for f in ctx.get("functions", [])):
             console.print("  [dim]→ main[/dim]")
             _action_generate_main(ctx, project_dir, language)
         ctx = load_context(project_dir)
@@ -1027,6 +1030,10 @@ def _ocaml_topo_sort(files: list[Path]) -> list[Path]:
 
 def _action_run_main(context: dict, project_dir: Path, language: str) -> None:
     """Compile (if needed) and run src/main.{ext}, display output or error."""
+    if language == "lean":
+        console.print("  [dim]Lean: use `lake build` in your project directory to type-check.[/dim]")
+        return
+
     cfg = LANGUAGE_CONFIGS.get(language, LANGUAGE_CONFIGS["c++"])
     ext = cfg["ext"]
     src_dir = project_dir / "src"
@@ -1305,6 +1312,10 @@ def main():
 
             if action == "language":
                 CURRENT_LANGUAGE = _prompt_language()
+                ctx = load_context(project_dir)
+                if ctx:
+                    ctx["language"] = CURRENT_LANGUAGE
+                    save_context(project_dir, ctx)
                 continue
 
             if action == "modify":
@@ -1414,6 +1425,10 @@ def main():
                     next_action = "edit"
                 elif action == "language":
                     CURRENT_LANGUAGE = _prompt_language()
+                    ctx = load_context(project_dir)
+                    if ctx:
+                        ctx["language"] = CURRENT_LANGUAGE
+                        save_context(project_dir, ctx)
                     _inject_errors_into_file(tmp_spec, spec_input, errors)
                     next_action = "edit"
                 elif action == "quit":

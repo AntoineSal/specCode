@@ -66,7 +66,6 @@ Get back verified C++ (or Python, Rust, OCaml, Go, TypeScript).
 Once `myInsert` exists in your project, write a spec that declares its dependency:
 
 ```lean
--- language: c++
 -- depends: myInsert
 def insertionSort (l : List Int) : List Int := sorry
 
@@ -184,12 +183,13 @@ and `SPECS.md` entirely.
 
 ## Spec annotations
 
-Lean specs support two optional header comments:
+Lean specs support one optional header comment:
 
 | Annotation | Example | Effect |
 |------------|---------|--------|
-| `-- language:` | `-- language: rust` | Override the project language for this spec |
 | `-- depends:` | `-- depends: myInsert, myFind` | Declare dependencies — their signatures are injected into the prompt |
+
+The output language is set project-wide via `[l]` in the menu — no per-spec override needed.
 
 Dependencies are resolved automatically. speccode reads `speccode.context`, finds the
 signatures of declared dependencies, and passes them to the model along with the
